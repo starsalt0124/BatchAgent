@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from .models import BatchConfig, Task
+
+
+_TOKEN_RE = re.compile(r"{{\s*([^{}]+?)\s*}}")
+
+
+def _lookup(path: str, task: Task, config: BatchConfig) -> Any:
+    root: Any
+    if path == "task":
+        return {
+            "id": task.id,
+            "status": task.status,
+            "kind": task.kind,
+            "input": task.input,
+            "attempts": task.attempts,
+        }
+    if path == "config":
+        return config.raw
+    if path == "workspace":
+        return config.workspace
+    if path.startswith("task."):
+        root = {
+            "id": task.id,
+            "status": task.status,
+            "kind": task.kind,
+            "input": task.input,
+            "attempts": task.attempts,
+            "result": task.result,
+            "error": task.error,
+        }
+        parts = path.split(".")[1:]
+    elif path.startswith("config."):
+        root = config.raw
+        parts = path.split(".")[1:]
+    else:
+        return ""
+
+    for part in parts:
+        if isinstance(root, dict):
+            root = root.get(part, "")
+        else:
+            root = getattr(root, part, "")
+    return root
+
+
+def render_template(template: str, task: Task, config: BatchConfig) -> str:
+    def replace(match: re.Match[str]) -> str:
+        value = _lookup(match.group(1), task, config)
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
+    return _TOKEN_RE.sub(replace, template)
+
