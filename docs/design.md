@@ -28,6 +28,8 @@ Markdown manifest
   -> artifact validator
   -> manifest writeback
   -> SQLite session/event store
+  -> progress event stream
+  -> Rich dashboard / plain logs
 ```
 
 Core modules:
@@ -41,6 +43,7 @@ Core modules:
 - `batchagent.web_tools`: web search and web fetch helpers.
 - `batchagent.validation`: deterministic artifact checks.
 - `batchagent.store`: SQLite session, message, tool event, and artifact persistence.
+- `batchagent.progress`: cross-platform Rich dashboard and plain progress fallback.
 
 ## Manifest Contract
 
@@ -151,10 +154,20 @@ Validator commands receive:
 - The manifest is updated before each task starts, so interrupted tasks are visible as `running`.
 - Each run has a unique lease id.
 - SQLite records runs, messages, tool events, and artifacts.
+- Scheduler emits progress events for loaded, queued, running, retry, done, and failed tasks.
+- The Rich dashboard is a subscriber to those events; disabling UI does not change execution semantics.
 - Provider and tool errors are either retried or returned to the model.
 - Task timeout is enforced by the scheduler.
 - `recover` moves stale `running` tasks back to `retry`, `failed`, or `todo`.
 - Manifest writes are atomic and guarded by a lock file.
+
+## Failure Recovery
+
+- `failures` lists failed tasks and prints recovery commands.
+- `inspect` reads SQLite state for one task, including run attempts, tool events, artifacts, and recent messages.
+- `retry` marks failed or selected tasks as `retry` while preserving attempts unless `--reset-attempts` is used.
+- `rerun` resets selected tasks to `todo`, clears result/error, and resets attempts.
+- `run --only <task-id>` executes one selected task, and `run --focus <task-id>` keeps it visible in the dashboard.
 
 ## Patch Compatibility Example Shape
 

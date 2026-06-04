@@ -153,6 +153,17 @@ Run tasks:
 python -m batchagent run BATCHAGENT.md --limit 2
 ```
 
+`run` uses a Rich live dashboard by default when Rich is installed. The dashboard shows loaded, eligible, running, completed, failed, elapsed time, ETA, and the concrete running task ids.
+
+Useful run options:
+
+```powershell
+python -m batchagent run BATCHAGENT.md --focus task-id
+python -m batchagent run BATCHAGENT.md --only task-id --retry-failed
+python -m batchagent run BATCHAGENT.md --plain
+python -m batchagent run BATCHAGENT.md --no-progress
+```
+
 Show progress:
 
 ```powershell
@@ -164,6 +175,19 @@ Recover interrupted leases:
 ```powershell
 python -m batchagent recover BATCHAGENT.md --to retry
 ```
+
+Inspect and recover failures:
+
+```powershell
+python -m batchagent failures BATCHAGENT.md
+python -m batchagent inspect BATCHAGENT.md task-id
+python -m batchagent retry BATCHAGENT.md task-id
+python -m batchagent run BATCHAGENT.md --only task-id
+python -m batchagent rerun BATCHAGENT.md task-id
+python -m batchagent run BATCHAGENT.md --only task-id
+```
+
+`retry` keeps the attempt counter by default and marks a failed task as `retry`. `rerun` resets status to `todo`, clears result/error, and resets attempts to `0`.
 
 ## Tools Exposed to Agents
 

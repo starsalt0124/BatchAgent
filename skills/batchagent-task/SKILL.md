@@ -98,10 +98,22 @@ python -m batchagent status BATCHAGENT.md
 python -m batchagent run BATCHAGENT.md
 ```
 
+The run command uses a Rich live dashboard when available. Use `--plain` for line-oriented logs, `--no-progress` for quiet execution, and `--focus <task-id>` to keep one task visible in the dashboard.
+
 5. If interrupted, recover stale leases:
 
 ```bash
 python -m batchagent recover BATCHAGENT.md --to retry
+```
+
+6. Inspect or retry failures:
+
+```bash
+python -m batchagent failures BATCHAGENT.md
+python -m batchagent inspect BATCHAGENT.md <task-id>
+python -m batchagent retry BATCHAGENT.md <task-id>
+python -m batchagent run BATCHAGENT.md --only <task-id>
+python -m batchagent rerun BATCHAGENT.md <task-id>
 ```
 
 ## Completion Rule

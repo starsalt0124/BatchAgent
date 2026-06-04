@@ -146,3 +146,95 @@ class SessionStore:
         )
         return [f"attempt {attempt}: {error}" for attempt, error in cursor.fetchall()]
 
+    def task_runs(self, task_id: str) -> list[dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT run_id, task_id, attempt, status, run_dir, started_at, finished_at, error
+            FROM runs
+            WHERE task_id = ?
+            ORDER BY started_at DESC
+            """,
+            (task_id,),
+        )
+        return [
+            {
+                "run_id": run_id,
+                "task_id": task_id,
+                "attempt": attempt,
+                "status": status,
+                "run_dir": run_dir,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "error": error or "",
+            }
+            for run_id, task_id, attempt, status, run_dir, started_at, finished_at, error in cursor.fetchall()
+        ]
+
+    def run_messages(self, run_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT seq, role, content, raw_json, created_at
+            FROM messages
+            WHERE run_id = ?
+            ORDER BY seq DESC
+            LIMIT ?
+            """,
+            (run_id, limit),
+        )
+        rows = cursor.fetchall()
+        rows.reverse()
+        return [
+            {
+                "seq": seq,
+                "role": role,
+                "content": content or "",
+                "raw": json.loads(raw_json or "{}"),
+                "created_at": created_at,
+            }
+            for seq, role, content, raw_json, created_at in rows
+        ]
+
+    def run_tool_events(self, run_id: str, limit: int = 30) -> list[dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT seq, tool_name, arguments_json, result_json, error, created_at
+            FROM tool_events
+            WHERE run_id = ?
+            ORDER BY seq DESC
+            LIMIT ?
+            """,
+            (run_id, limit),
+        )
+        rows = cursor.fetchall()
+        rows.reverse()
+        return [
+            {
+                "seq": seq,
+                "tool_name": tool_name,
+                "arguments": json.loads(arguments_json or "{}"),
+                "result": json.loads(result_json or "{}"),
+                "error": error or "",
+                "created_at": created_at,
+            }
+            for seq, tool_name, arguments_json, result_json, error, created_at in rows
+        ]
+
+    def run_artifacts(self, run_id: str) -> list[dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT summary, artifact_path, metadata_json, created_at
+            FROM artifacts
+            WHERE run_id = ?
+            ORDER BY created_at DESC
+            """,
+            (run_id,),
+        )
+        return [
+            {
+                "summary": summary,
+                "artifact_path": artifact_path or "",
+                "metadata": json.loads(metadata_json or "{}"),
+                "created_at": created_at,
+            }
+            for summary, artifact_path, metadata_json, created_at in cursor.fetchall()
+        ]

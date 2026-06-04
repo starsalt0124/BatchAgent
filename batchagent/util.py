@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +65,12 @@ def truncate(value: str, limit: int = 500) -> str:
     return value[: limit - 3] + "..."
 
 
+def console_safe(value: object) -> str:
+    text = str(value)
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    return text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+
+
 class ManifestLock:
     def __init__(self, manifest_path: Path):
         self.path = manifest_path.with_suffix(manifest_path.suffix + ".lock")
@@ -92,4 +99,3 @@ class ManifestLock:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.release()
-
