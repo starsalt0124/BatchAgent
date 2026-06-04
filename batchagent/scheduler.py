@@ -8,6 +8,7 @@ from .agent import run_agent_task
 from .manifest import load_manifest, save_manifest
 from .models import AgentRunResult, Manifest, Task
 from .store import SessionStore
+from .tools import unknown_tool_names
 from .util import ManifestLock, truncate, utc_now
 
 
@@ -22,7 +23,7 @@ async def run_manifest(
     retry_failed: bool = False,
 ) -> list[AgentRunResult]:
     manifest = load_manifest(manifest_path)
-    _validate_manifest(manifest)
+    validate_manifest(manifest)
     state_db = _state_db_path(manifest)
     store = SessionStore(state_db)
     semaphore = asyncio.Semaphore(manifest.config.effective_concurrency)
@@ -140,10 +141,17 @@ def _state_db_path(manifest: Manifest) -> Path:
     return run_dir / "state.sqlite3"
 
 
-def _validate_manifest(manifest: Manifest) -> None:
+def validate_manifest(manifest: Manifest) -> None:
     ids = [task.id for task in manifest.tasks]
     duplicates = sorted({task_id for task_id in ids if ids.count(task_id) > 1})
     if duplicates:
         raise SchedulerError(f"duplicate task ids: {', '.join(duplicates)}")
     if not manifest.config.user_prompt_template.strip():
         raise SchedulerError("user_prompt_template is required")
+    unknown = unknown_tool_names(manifest.config)
+    if unknown:
+        raise SchedulerError(f"unknown tools in manifest config: {', '.join(unknown)}")
+    if manifest.config.artifact.require_submit and "submit_artifact" not in manifest.config.tools:
+        raise SchedulerError("artifact.require_submit is true but submit_artifact is not listed in tools")
+    if "run_command" in manifest.config.tools and not manifest.config.allowed_command_prefixes:
+        raise SchedulerError("run_command is loaded but allowed_command_prefixes is empty")

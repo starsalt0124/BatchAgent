@@ -67,6 +67,24 @@ base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
 model = "deepseek-v4-flash"
 temperature = 0
+tools = [
+  "read_file",
+  "write_file",
+  "web_search",
+  "web_fetch",
+  "submit_artifact"
+]
+
+blocked_path_patterns = [
+  ".git",
+  ".git/**",
+  ".batchagent",
+  ".batchagent/**",
+  ".env",
+  "**/.env",
+  "**/*.pem",
+  "**/*.key"
+]
 
 system_prompt = """
 You are a patch compatibility analysis agent.
@@ -82,6 +100,12 @@ allowed_command_prefixes = [
   ["python", "D:/pcia_skill/patch-compatibility-analyzer/scripts/orchestrator.py"],
   ["git", "show"]
 ]
+blocked_command_patterns = [
+  "\\bRemove-Item\\b",
+  "\\brm\\b",
+  "\\bgit\\s+(?:reset|clean|checkout)\\b"
+]
+command_clean_env = true
 
 [artifact]
 require_submit = true
@@ -143,13 +167,35 @@ python -m batchagent recover BATCHAGENT.md --to retry
 
 ## Tools Exposed to Agents
 
+Tools are explicitly loaded by the manifest `tools` list. If `tools` is omitted or empty, no tools are exposed to the model. If `[artifact].require_submit = true`, `submit_artifact` must be listed.
+
 - `read_file`: read UTF-8 files inside the workspace.
 - `list_files`: list files inside the workspace.
+- `glob`: find files by glob pattern inside the workspace.
+- `grep_search`: search text files inside the workspace.
 - `write_file`: write UTF-8 files unless `workspace_mode = "readonly"`.
-- `run_command`: only available when `allowed_command_prefixes` is configured.
+- `edit_file`: replace exact text in a workspace file.
+- `file_edit`: replace a 1-based line range in a workspace file.
+- `delete_file`: delete only files created by the same task run.
+- `web_search`: search the public web through DuckDuckGo HTML.
+- `web_fetch`: fetch a web page and return readable text.
+- `tool_search`: search known BatchAgent tool schemas.
+- `run_command`: only available when loaded and `allowed_command_prefixes` is configured.
 - `submit_artifact`: required completion signal by default.
 
 Every task run is saved in SQLite under `run_dir/state.sqlite3`, and each run has a folder with `task.json` and `artifact.json` when submitted.
+
+## Safety Defaults
+
+- File tools resolve paths inside the configured workspace and reject path escapes.
+- `blocked_path_patterns` denies sensitive workspace paths such as `.git`, `.env`, private keys, and manifest state.
+- `workspace_mode = "readonly"` disables all write tools.
+- `delete_file` only deletes files created by that same task run.
+- `run_command` accepts token arrays, never shell strings.
+- `run_command` requires an exact prefix match in `allowed_command_prefixes`.
+- Delete commands, shell interpreter commands, registry/system commands, reboot/format commands, and configured `blocked_command_patterns` are rejected before execution.
+- Command arguments that are absolute paths must stay inside the workspace or the task run directory.
+- `command_clean_env = true` prevents command tools from inheriting provider API keys and unrelated environment variables.
 
 ## Failure Handling
 
@@ -160,4 +206,3 @@ Every task run is saved in SQLite under `run_dir/state.sqlite3`, and each run ha
 - Artifact metadata and paths are validated before the manifest is marked `done`.
 - Failed tasks retry up to `retries`; otherwise they become `failed`.
 - Interrupted `running` tasks can be moved back with `recover`.
-

@@ -90,6 +90,7 @@ base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
 model = "deepseek-v4-flash"
 temperature = 0
+tools = ["write_file", "submit_artifact"]
 
 system_prompt = \"\"\"
 You are a batch task agent. Complete exactly one assigned task.
@@ -158,7 +159,18 @@ def _parse_config(text: str) -> BatchConfig:
         system_prompt=str(raw.get("system_prompt", "")),
         user_prompt_template=str(raw.get("user_prompt_template", "")),
         memory_files=list(raw.get("memory_files", [])),
+        tools=list(raw.get("tools", [])),
         allowed_command_prefixes=[_command_prefix(prefix) for prefix in raw.get("allowed_command_prefixes", [])],
+        blocked_command_patterns=list(raw.get("blocked_command_patterns", [])),
+        blocked_path_patterns=list(
+            raw.get(
+                "blocked_path_patterns",
+                [".git", ".git/**", ".batchagent", ".batchagent/**", ".env", "**/.env", "**/*.pem", "**/*.key", "**/id_rsa", "**/id_ed25519"],
+            )
+        ),
+        command_clean_env=bool(raw.get("command_clean_env", True)),
+        web_timeout_seconds=int(raw.get("web_timeout_seconds", 15)),
+        web_max_chars=int(raw.get("web_max_chars", 20000)),
         artifact=artifact,
         raw=raw,
     )

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .manifest import ManifestError, create_sample_manifest, load_manifest
 from .provider import create_provider
-from .scheduler import recover_running, run_manifest, status
+from .scheduler import recover_running, run_manifest, status, validate_manifest
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -46,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "doctor":
             manifest = load_manifest(args.manifest)
+            validate_manifest(manifest)
             _print_manifest_summary(manifest)
             return 0
         if args.command == "status":
@@ -78,6 +79,7 @@ def _print_manifest_summary(manifest) -> None:
     print(f"name: {manifest.config.name}")
     print(f"provider: {manifest.config.provider}")
     print(f"model: {manifest.config.model}")
+    print(f"tools: {', '.join(manifest.config.tools) if manifest.config.tools else '(none)'}")
     print(f"workspace: {Path(manifest.config.workspace)} ({manifest.config.workspace_mode})")
     print(f"parallel: {manifest.config.parallel}, max_concurrency: {manifest.config.effective_concurrency}")
     print(f"tasks: {len(manifest.tasks)}")
@@ -98,4 +100,3 @@ def _models(args) -> int:
     provider = create_provider(config)
     print(json.dumps(provider.list_models(), ensure_ascii=False, indent=2))
     return 0
-

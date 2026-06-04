@@ -38,6 +38,9 @@ base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
 model = "deepseek-v4-flash"
 temperature = 0
+tools = ["read_file", "write_file", "web_search", "web_fetch", "submit_artifact"]
+blocked_path_patterns = [".git", ".git/**", ".batchagent", ".batchagent/**", ".env", "**/.env", "**/*.pem", "**/*.key"]
+command_clean_env = true
 
 system_prompt = """
 Shared role and policy.
@@ -55,6 +58,8 @@ require_artifact_path = true
 required_metadata_keys = ["task_id", "status"]
 ```
 
+`tools` is explicit. If omitted or empty, no tools are loaded. If `require_submit = true`, `submit_artifact` must be included.
+
 Add `allowed_command_prefixes` only for commands the agent is allowed to run:
 
 ```toml
@@ -62,7 +67,10 @@ allowed_command_prefixes = [
   ["python", "D:/tools/orchestrator.py"],
   ["git", "show"]
 ]
+blocked_command_patterns = ["\\bRemove-Item\\b", "\\brm\\b", "\\bgit\\s+(?:reset|clean|checkout)\\b"]
 ```
+
+In unattended batch mode, avoid `run_command` unless there is a concrete need. Prefer workspace-scoped tools such as `read_file`, `write_file`, `grep_search`, `web_search`, and `web_fetch`.
 
 ## Execution Workflow
 
@@ -119,4 +127,3 @@ The prompt template should expand those fields and instruct the agent to submit 
   "cleaned_worktree": true
 }
 ```
-

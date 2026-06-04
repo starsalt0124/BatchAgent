@@ -37,6 +37,8 @@ Core modules:
 - `batchagent.agent`: OpenAI-compatible tool-calling loop.
 - `batchagent.provider`: DeepSeek/OpenAI-compatible HTTP client.
 - `batchagent.tools`: workspace-limited tools exposed to the model.
+- `batchagent.security`: path, command, and environment safety checks.
+- `batchagent.web_tools`: web search and web fetch helpers.
 - `batchagent.validation`: deterministic artifact checks.
 - `batchagent.store`: SQLite session, message, tool event, and artifact persistence.
 
@@ -54,6 +56,7 @@ workspace = "."
 workspace_mode = "copy"
 parallel = true
 max_concurrency = 4
+tools = ["read_file", "write_file", "web_search", "web_fetch", "submit_artifact"]
 ...
 ```
 ```
@@ -92,17 +95,40 @@ For concurrent patch-analysis jobs, `copy` is the safer default because many too
 
 ## Tool Protocol
 
-The model receives:
+Tools are not loaded by default. The model receives only the names listed in `tools = [...]`.
 
 - `read_file(path, offset, limit)`
 - `list_files(path, pattern, recursive, limit)`
+- `glob(pattern, base_path, limit)`
+- `grep_search(query, path, pattern, case_sensitive, limit)`
 - `write_file(path, content, append)`
-- `run_command(command, working_dir, timeout_seconds)` only when allowlisted
+- `edit_file(path, find, replace)`
+- `file_edit(path, start_line, end_line, replacement)`
+- `delete_file(path)` only for files created by the current task run
+- `web_search(query, limit, domains)`
+- `web_fetch(url, prompt, max_chars)`
+- `tool_search(query, limit)`
+- `run_command(command, working_dir, timeout_seconds)` only when explicitly loaded and allowlisted
 - `submit_artifact(summary, artifact_path, metadata)`
 
 All paths are resolved inside the active workspace. Symlink escapes and `..` escapes are rejected.
 
 `run_command` is disabled unless `allowed_command_prefixes` is configured. The model must supply command tokens, not a shell string.
+
+## Safety Strategy
+
+Batch execution has no per-turn human approval, so safety is deny-heavy:
+
+- No tools are exposed unless the manifest lists them.
+- Unknown tools fail `doctor` and `run`.
+- If `artifact.require_submit = true`, `submit_artifact` must be loaded.
+- `blocked_path_patterns` denies sensitive workspace paths such as `.git`, `.env`, and private keys.
+- `workspace_mode = "readonly"` blocks write, edit, delete, and command writes.
+- `delete_file` can only delete a file created by the same task run.
+- `run_command` requires an exact token-prefix allowlist match.
+- Delete commands, shell interpreter commands, reboot/format/registry commands, and configured `blocked_command_patterns` are rejected.
+- Absolute command path arguments must stay inside the workspace or run directory.
+- `command_clean_env = true` avoids leaking API keys and unrelated environment variables into command tools.
 
 ## Artifact Protocol
 
@@ -144,4 +170,3 @@ Each patch row can store only the variable fields:
 ```
 
 The shared PCA instructions, repo paths, command allowlist, and artifact requirements belong in the TOML config and prompt template. This avoids duplicating large prompts per row.
-

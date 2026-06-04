@@ -40,6 +40,8 @@ async def run_agent_task(
     seq = 0
 
     try:
+        if config.artifact.require_submit and "submit_artifact" not in config.tools:
+            raise AgentExecutionError("artifact.require_submit is true but submit_artifact is not loaded in tools")
         write_json(run_dir / "task.json", {"task": task.__dict__, "workspace": str(workspace)})
         for message in messages:
             seq += 1
@@ -109,8 +111,8 @@ def _initial_messages(config: BatchConfig, task: Task, store: SessionStore, work
 
 def _protocol_prompt(config: BatchConfig) -> str:
     command_note = (
-        "The run_command tool is available only for allowlisted commands."
-        if config.allowed_command_prefixes
+        "run_command is loaded, but it is available only for allowlisted commands that pass safety review."
+        if "run_command" in config.tools
         else "No shell command tool is available for this task."
     )
     submit_note = (
@@ -118,11 +120,18 @@ def _protocol_prompt(config: BatchConfig) -> str:
         if config.artifact.require_submit
         else "You may call submit_artifact to attach structured output."
     )
+    tool_note = (
+        "Loaded tools: " + ", ".join(config.tools)
+        if config.tools
+        else "No tools are loaded. Complete the task from the prompt context only."
+    )
     return "\n".join(
         [
             "BatchAgent harness protocol:",
             "- You are assigned exactly one task. Do not claim work on any other task.",
-            "- Use read_file/list_files/write_file for workspace I/O when needed.",
+            f"- {tool_note}",
+            "- Use only the tools listed above; unloaded tools are intentionally unavailable.",
+            "- File and command tools are restricted to the workspace and policy checks.",
             f"- {command_note}",
             f"- {submit_note}",
             "- submit_artifact metadata should include task-specific machine-readable fields, not only prose.",

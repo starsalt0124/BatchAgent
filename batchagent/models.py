@@ -44,7 +44,26 @@ class BatchConfig:
     system_prompt: str = ""
     user_prompt_template: str = ""
     memory_files: list[str] = field(default_factory=list)
+    tools: list[str] = field(default_factory=list)
     allowed_command_prefixes: list[list[str]] = field(default_factory=list)
+    blocked_command_patterns: list[str] = field(default_factory=list)
+    blocked_path_patterns: list[str] = field(
+        default_factory=lambda: [
+            ".git",
+            ".git/**",
+            ".batchagent",
+            ".batchagent/**",
+            ".env",
+            "**/.env",
+            "**/*.pem",
+            "**/*.key",
+            "**/id_rsa",
+            "**/id_ed25519",
+        ]
+    )
+    command_clean_env: bool = True
+    web_timeout_seconds: int = 15
+    web_max_chars: int = 20000
     artifact: ArtifactPolicy = field(default_factory=ArtifactPolicy)
     raw: dict[str, Any] = field(default_factory=dict)
 

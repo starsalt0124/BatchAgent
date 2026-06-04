@@ -27,11 +27,12 @@ class OpenAICompatibleProvider:
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
             "stream": False,
             "temperature": self.config.temperature,
         }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         if self.config.max_tokens is not None:
             payload["max_tokens"] = self.config.max_tokens
         if self.config.reasoning_effort:
@@ -115,4 +116,3 @@ def _parse_chat_response(payload: dict[str, Any]) -> ChatMessage:
         tool_calls=tool_calls,
         raw=message,
     )
-
