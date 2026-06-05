@@ -99,7 +99,7 @@ async def run_agent_task(
 
 
 def _initial_messages(config: BatchConfig, task: Task, store: SessionStore, workspace: Path) -> list[dict[str, Any]]:
-    system = config.system_prompt.strip()
+    system = render_template(config.system_prompt, task, config).strip()
     protocol = _protocol_prompt(config)
     memory = _memory_prompt(config, task, store, workspace)
     user = render_template(config.user_prompt_template, task, config).strip()

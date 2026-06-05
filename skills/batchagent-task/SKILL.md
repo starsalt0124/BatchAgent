@@ -50,6 +50,7 @@ user_prompt_template = """
 Task id: {{task.id}}
 Task kind: {{task.kind}}
 Task input: {{task.input}}
+Current date: CURR_DATE
 """
 
 [artifact]
@@ -59,6 +60,8 @@ required_metadata_keys = ["task_id", "status"]
 ```
 
 `tools` is explicit. If omitted or empty, no tools are loaded. If `require_submit = true`, `submit_artifact` must be included.
+
+Prompt templates support `CURR_DATE` and `{{CURR_DATE}}`; both are replaced when a task is dispatched with the current local date in `YYYY-MM-DD` format. Use it for date-sensitive research and status reports.
 
 Add `allowed_command_prefixes` only for commands the agent is allowed to run:
 

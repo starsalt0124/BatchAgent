@@ -13,7 +13,12 @@ class TemplateTests(unittest.TestCase):
         result = render_template("{{task.id}} {{task.input.patch_file}} {{workspace}}", task, config)
         self.assertEqual(result, "abc patches/a.patch repo")
 
+    def test_renders_current_date_keyword(self) -> None:
+        task = Task(status="todo", id="abc")
+        config = BatchConfig()
+        result = render_template("today=CURR_DATE templated={{CURR_DATE}}", task, config, current_date="2026-06-05")
+        self.assertEqual(result, "today=2026-06-05 templated=2026-06-05")
+
 
 if __name__ == "__main__":
     unittest.main()
-

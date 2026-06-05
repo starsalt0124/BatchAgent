@@ -125,6 +125,13 @@ Task rows live between markers:
 <!-- batchagent:tasks-end -->
 ```
 
+Prompt templates support both structured placeholders and a small set of built-ins:
+
+- `{{task.id}}`, `{{task.kind}}`, `{{task.input.some_key}}`
+- `{{config.some_key}}`
+- `{{workspace}}`
+- `CURR_DATE` or `{{CURR_DATE}}`, replaced at task dispatch time with the current local date in `YYYY-MM-DD` format
+
 Statuses:
 
 - `todo`: eligible.
