@@ -6,7 +6,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .models import BatchConfig, ChatMessage, ToolCall
 
@@ -19,7 +19,12 @@ class ProviderError(RuntimeError):
 class OpenAICompatibleProvider:
     config: BatchConfig
 
-    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ChatMessage:
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        delta_callback: Callable[[str], None] | None = None,
+    ) -> ChatMessage:
         api_key = os.environ.get(self.config.api_key_env)
         if not api_key:
             raise ProviderError(f"missing API key environment variable: {self.config.api_key_env}")
@@ -27,7 +32,7 @@ class OpenAICompatibleProvider:
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
-            "stream": False,
+            "stream": delta_callback is not None,
             "temperature": self.config.temperature,
         }
         if tools:
@@ -53,8 +58,10 @@ class OpenAICompatibleProvider:
             try:
                 request = urllib.request.Request(url, data=data, headers=headers, method="POST")
                 with urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds) as response:
+                    if delta_callback is not None:
+                        return _parse_stream_response(response, delta_callback)
                     body = response.read().decode("utf-8")
-                return _parse_chat_response(json.loads(body))
+                    return _parse_chat_response(json.loads(body))
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
                 last_error = ProviderError(f"provider HTTP {exc.code}: {body}")
@@ -116,3 +123,51 @@ def _parse_chat_response(payload: dict[str, Any]) -> ChatMessage:
         tool_calls=tool_calls,
         raw=message,
     )
+
+
+def _parse_stream_response(response, delta_callback: Callable[[str], None]) -> ChatMessage:
+    content_parts: list[str] = []
+    tool_calls_by_index: dict[int, dict[str, Any]] = {}
+    role = "assistant"
+    for raw_line in response:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        choices = payload.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        role = str(delta.get("role") or role)
+        content = delta.get("content")
+        if content:
+            content_parts.append(str(content))
+            delta_callback(str(content))
+        for item in delta.get("tool_calls") or []:
+            index = int(item.get("index", len(tool_calls_by_index)))
+            current = tool_calls_by_index.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+            if item.get("id"):
+                current["id"] = item["id"]
+            if item.get("type"):
+                current["type"] = item["type"]
+            function = item.get("function") or {}
+            current_function = current.setdefault("function", {"name": "", "arguments": ""})
+            if function.get("name"):
+                current_function["name"] = str(current_function.get("name") or "") + str(function["name"])
+            if function.get("arguments"):
+                current_function["arguments"] = str(current_function.get("arguments") or "") + str(function["arguments"])
+
+    tool_calls = [tool_calls_by_index[index] for index in sorted(tool_calls_by_index)]
+    message = {
+        "role": role,
+        "content": "".join(content_parts) if content_parts else None,
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return _parse_chat_response({"choices": [{"message": message}]})

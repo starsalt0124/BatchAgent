@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import select
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -23,6 +26,10 @@ class TaskProgress:
     error: str = ""
     run_id: str = ""
     run_dir: str = ""
+    artifact_path: str = ""
+    detail: str = ""
+    stream_text: str = ""
+    events: list[str] = field(default_factory=list)
     started_monotonic: float | None = None
     finished_monotonic: float | None = None
     current_run_started_monotonic: float | None = None
@@ -50,6 +57,7 @@ class ProgressState:
     concurrency: int = 1
     tasks: dict[str, TaskProgress] = field(default_factory=dict)
     current_run_task_ids: set[str] = field(default_factory=set)
+    view_mode: str = "overview"
 
     @classmethod
     def from_manifest(cls, manifest: Manifest, focus_task_id: str = "") -> "ProgressState":
@@ -95,6 +103,38 @@ class ProgressState:
             task.current_run_started_monotonic = now
             task.finished_monotonic = None
             task.error = ""
+            task.detail = "model starting"
+            return
+        if event_type == "model_delta":
+            delta = str(event.get("delta") or "")
+            if delta:
+                task.stream_text = _tail_text(task.stream_text + delta, 5000)
+                task.detail = _last_nonempty_line(task.stream_text) or "model streaming"
+            return
+        if event_type == "assistant_message":
+            content = str(event.get("content") or "")
+            if content:
+                task.stream_text = _tail_text(content, 5000)
+                task.detail = _last_nonempty_line(content) or "assistant message"
+            return
+        if event_type == "tool_started":
+            tool = str(event.get("tool") or "")
+            text = f"calling {tool}"
+            task.detail = text
+            task.events.append(text)
+            task.events = task.events[-30:]
+            return
+        if event_type == "tool_finished":
+            tool = str(event.get("tool") or "")
+            error = str(event.get("error") or "")
+            text = f"{tool} failed: {error}" if error else f"{tool} finished"
+            task.detail = text
+            task.events.append(text)
+            task.events = task.events[-30:]
+            return
+        if event_type == "artifact_submitted":
+            task.artifact_path = str(event.get("artifact_path") or "")
+            task.detail = f"submitted {task.artifact_path}" if task.artifact_path else "artifact submitted"
             return
         if event_type in {"task_done", "task_failed", "task_retry"}:
             task.status = {"task_done": "done", "task_failed": "failed", "task_retry": "retry"}[event_type]
@@ -102,7 +142,25 @@ class ProgressState:
             task.run_dir = str(event.get("run_dir") or task.run_dir)
             task.result = str(event.get("result") or task.result)
             task.error = str(event.get("error") or "")
+            if task.status == "done":
+                task.detail = task.artifact_path or task.result or task.run_dir
+            elif task.error:
+                task.detail = task.error
             task.finished_monotonic = now
+
+    def move_focus(self, offset: int) -> None:
+        ordered = [task.id for task in self.ordered_tasks()]
+        if not ordered:
+            return
+        if self.focus_task_id not in ordered:
+            self.focus_task_id = ordered[0]
+            return
+        index = ordered.index(self.focus_task_id)
+        self.focus_task_id = ordered[(index + offset) % len(ordered)]
+
+    def ordered_tasks(self) -> list[TaskProgress]:
+        rank = {"running": 0, "retry": 1, "queued": 2, "failed": 3, "todo": 4, "done": 5, "skipped": 6}
+        return sorted(self.tasks.values(), key=lambda task: (rank.get(task.status, 9), task.id))
 
     def counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -168,13 +226,15 @@ class RichRunDisplay:
             return await awaitable
         Live = self._rich["Live"]
         console = self._rich["Console"]()
-        with Live(self.render(), console=console, refresh_per_second=4, transient=False) as live:
+        with KeyPoller() as keys, Live(self.render(), console=console, refresh_per_second=4, transient=False, screen=True) as live:
             task = asyncio.create_task(awaitable)
             while not task.done():
+                self._handle_key(keys.get_key())
                 live.update(self.render())
                 await asyncio.sleep(0.25)
             result = await task
             live.update(self.render(final=True))
+            await asyncio.sleep(0.5)
             return result
 
     def render(self, final: bool = False) -> Any:
@@ -231,16 +291,24 @@ class RichRunDisplay:
             )
 
         focused = self._focused_panel()
-        panels = [Panel(header, title=title), Panel(task_table, title="Tasks")]
+        help_text = "Keys: ↑/↓ focus task | Enter detail page | Esc overview"
+        panels = [Panel(header, title=title), Panel(help_text, title="Controls")]
+        if self.state.view_mode == "task":
+            focused = self._focused_panel(full=True)
+            if focused is not None:
+                panels.append(focused)
+            else:
+                panels.append(Panel(task_table, title="Tasks"))
+            return Group(*panels)
+        panels.append(Panel(task_table, title="Tasks"))
         if focused is not None:
             panels.append(focused)
         return Group(*panels)
 
     def _ordered_tasks(self) -> list[TaskProgress]:
-        rank = {"running": 0, "retry": 1, "queued": 2, "failed": 3, "todo": 4, "done": 5, "skipped": 6}
-        return sorted(self.state.tasks.values(), key=lambda task: (rank.get(task.status, 9), task.id))
+        return self.state.ordered_tasks()
 
-    def _focused_panel(self) -> Any | None:
+    def _focused_panel(self, full: bool = False) -> Any | None:
         if not self.state.focus_task_id or self._rich is None:
             return None
         Panel = self._rich["Panel"]
@@ -254,10 +322,25 @@ class RichRunDisplay:
                 f"attempts: {task.attempts}",
                 f"run_dir: {console_safe(task.run_dir)}",
                 f"result: {console_safe(task.result)}",
+                f"artifact: {console_safe(task.artifact_path)}",
                 f"error: {console_safe(task.error)}",
             ]
         )
-        return Panel(detail, title="Focus")
+        if full:
+            stream = console_safe(_tail_lines(task.stream_text, max(10, _terminal_height() - 20)))
+            events = console_safe("\n".join(task.events[-8:]))
+            detail = detail + "\n\nRecent tool/model events:\n" + events + "\n\nModel output tail:\n" + stream
+        return Panel(detail, title="Task Detail" if full else "Focus")
+
+    def _handle_key(self, key: str | None) -> None:
+        if key == "up":
+            self.state.move_focus(-1)
+        elif key == "down":
+            self.state.move_focus(1)
+        elif key == "enter":
+            self.state.view_mode = "task"
+        elif key == "esc":
+            self.state.view_mode = "overview"
 
 
 def _load_rich() -> dict[str, Any] | None:
@@ -302,3 +385,89 @@ def _status_style(status: str) -> str:
         "todo": "dim",
         "skipped": "magenta",
     }.get(status, "")
+
+
+class KeyPoller:
+    def __init__(self) -> None:
+        self._old_term = None
+
+    def __enter__(self) -> "KeyPoller":
+        if os.name != "nt" and sys.stdin.isatty():
+            try:
+                import termios
+                import tty
+
+                self._old_term = termios.tcgetattr(sys.stdin)
+                tty.setcbreak(sys.stdin.fileno())
+            except Exception:
+                self._old_term = None
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._old_term is not None:
+            try:
+                import termios
+
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_term)
+            except Exception:
+                pass
+
+    def get_key(self) -> str | None:
+        if not sys.stdin.isatty():
+            return None
+        if os.name == "nt":
+            try:
+                import msvcrt
+
+                if not msvcrt.kbhit():
+                    return None
+                ch = msvcrt.getwch()
+                if ch in {"\x00", "\xe0"}:
+                    code = msvcrt.getwch()
+                    return {"H": "up", "P": "down"}.get(code)
+                if ch == "\r":
+                    return "enter"
+                if ch == "\x1b":
+                    return "esc"
+            except Exception:
+                return None
+        else:
+            try:
+                readable, _, _ = select.select([sys.stdin], [], [], 0)
+                if not readable:
+                    return None
+                ch = sys.stdin.read(1)
+                if ch == "\n":
+                    return "enter"
+                if ch == "\x1b":
+                    readable, _, _ = select.select([sys.stdin], [], [], 0)
+                    if not readable:
+                        return "esc"
+                    seq = ch + sys.stdin.read(2)
+                    return {"\x1b[A": "up", "\x1b[B": "down"}.get(seq)
+            except Exception:
+                return None
+        return None
+
+
+def _tail_text(value: str, limit: int) -> str:
+    return value[-limit:] if len(value) > limit else value
+
+
+def _tail_lines(value: str, max_lines: int) -> str:
+    lines = value.splitlines()
+    return "\n".join(lines[-max_lines:])
+
+
+def _last_nonempty_line(value: str) -> str:
+    for line in reversed(value.splitlines()):
+        if line.strip():
+            return truncate(line.strip(), 120)
+    return ""
+
+
+def _terminal_height() -> int:
+    try:
+        return os.get_terminal_size().lines
+    except OSError:
+        return 30

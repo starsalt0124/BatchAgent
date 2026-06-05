@@ -4,7 +4,7 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .models import AgentRunResult, BatchConfig, Task
 from .provider import create_provider
@@ -26,6 +26,7 @@ async def run_agent_task(
     task: Task,
     store: SessionStore,
     run_id: str | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> AgentRunResult:
     run_id = run_id or uuid.uuid4().hex[:12]
     run_dir = task_run_dir(config, manifest_path, task, run_id)
@@ -48,14 +49,46 @@ async def run_agent_task(
             store.add_message(run_id, seq, message["role"], str(message.get("content") or ""), message)
 
         for _turn in range(config.max_turns):
-            assistant = await asyncio.to_thread(provider.chat, messages, specs)
+            assistant = await asyncio.to_thread(provider.chat, messages, specs, _delta_callback(progress_callback, task.id, run_id))
             seq += 1
             store.add_message(run_id, seq, "assistant", assistant.content, assistant.raw)
+            _emit(
+                progress_callback,
+                {
+                    "type": "assistant_message",
+                    "task_id": task.id,
+                    "run_id": run_id,
+                    "content": assistant.content or "",
+                    "timestamp": "",
+                },
+            )
             messages.append(_assistant_message_for_wire(assistant.raw))
 
             if assistant.tool_calls:
                 for tool_call in assistant.tool_calls:
+                    _emit(
+                        progress_callback,
+                        {
+                            "type": "tool_started",
+                            "task_id": task.id,
+                            "run_id": run_id,
+                            "tool": tool_call.name,
+                            "arguments": tool_call.arguments,
+                        },
+                    )
                     result, error = await _invoke_tool_safely(ctx, tool_call.name, tool_call.arguments)
+                    _emit(
+                        progress_callback,
+                        {
+                            "type": "tool_finished",
+                            "task_id": task.id,
+                            "run_id": run_id,
+                            "tool": tool_call.name,
+                            "arguments": tool_call.arguments,
+                            "error": error,
+                            "result": result,
+                        },
+                    )
                     seq += 1
                     store.add_tool_event(run_id, seq, tool_call.name, tool_call.arguments, result, error)
                     messages.append(
@@ -68,6 +101,17 @@ async def run_agent_task(
                     store.add_message(run_id, seq, "tool", messages[-1]["content"], messages[-1])
 
                 if ctx.submission is not None:
+                    _emit(
+                        progress_callback,
+                        {
+                            "type": "artifact_submitted",
+                            "task_id": task.id,
+                            "run_id": run_id,
+                            "summary": ctx.submission.summary,
+                            "artifact_path": ctx.submission.artifact_path,
+                            "metadata": ctx.submission.metadata,
+                        },
+                    )
                     validate_artifact(config, task, workspace, run_dir, ctx.submission)
                     store.add_artifact(
                         run_id,
@@ -167,3 +211,26 @@ async def _invoke_tool_safely(ctx: ToolContext, name: str, arguments: dict[str, 
         return result, ""
     except Exception as exc:
         return {}, str(exc)
+
+
+def _delta_callback(
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    task_id: str,
+    run_id: str,
+) -> Callable[[str], None] | None:
+    if progress_callback is None:
+        return None
+
+    def callback(delta: str) -> None:
+        _emit(progress_callback, {"type": "model_delta", "task_id": task_id, "run_id": run_id, "delta": delta})
+
+    return callback
+
+
+def _emit(callback: Callable[[dict[str, Any]], None] | None, event: dict[str, Any]) -> None:
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception:
+        pass

@@ -172,7 +172,7 @@ async def _run_one_with_retries(
         )
         try:
             result = await asyncio.wait_for(
-                run_agent_task(manifest.path, manifest.config, task, store, run_id=run_id),
+                run_agent_task(manifest.path, manifest.config, task, store, run_id=run_id, progress_callback=progress_callback),
                 timeout=manifest.config.timeout_seconds,
             )
         except asyncio.TimeoutError:

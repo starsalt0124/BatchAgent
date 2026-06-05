@@ -5,6 +5,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from .manifest import ManifestError, create_sample_manifest, load_manifest
 from .provider import create_provider
@@ -24,6 +25,10 @@ from .util import console_safe, truncate
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        return _interactive_main()
+
     parser = argparse.ArgumentParser(prog="batchagent", description="Markdown-driven batch agent harness.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -89,7 +94,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "run":
             results = asyncio.run(_run_with_progress(args))
-            _print_run_results(args.manifest, results)
+            if getattr(args, "_used_rich_progress", False):
+                _print_rich_completion(args.manifest, results)
+            else:
+                _print_run_results(args.manifest, results)
             return 0 if all(result.success for result in results) else 1
         if args.command == "recover":
             changed = recover_running(args.manifest, args.to)
@@ -123,10 +131,12 @@ async def _run_with_progress(args) -> list:
     validate_manifest(manifest)
     task_ids = set(args.only) if args.only else None
     if args.no_progress:
+        args._used_rich_progress = False
         return await run_manifest(args.manifest, limit=args.limit, retry_failed=args.retry_failed, task_ids=task_ids)
 
     state = ProgressState.from_manifest(manifest, focus_task_id=args.focus)
     if args.plain:
+        args._used_rich_progress = False
         plain = PlainProgress(state)
         return await run_manifest(
             args.manifest,
@@ -138,6 +148,7 @@ async def _run_with_progress(args) -> list:
 
     display = RichRunDisplay(state)
     if not display.available:
+        args._used_rich_progress = False
         plain = PlainProgress(state)
         return await run_manifest(
             args.manifest,
@@ -146,6 +157,7 @@ async def _run_with_progress(args) -> list:
             task_ids=task_ids,
             progress_callback=plain.callback,
         )
+    args._used_rich_progress = True
     return await display.run(
         run_manifest(
             args.manifest,
@@ -155,6 +167,127 @@ async def _run_with_progress(args) -> list:
             progress_callback=state.handle_event,
         )
     )
+
+
+def _interactive_main() -> int:
+    manifest_path = _choose_manifest_interactively()
+    if not manifest_path:
+        return 1
+    manifest = load_manifest(manifest_path)
+    validate_manifest(manifest)
+    _print_manifest_summary(manifest)
+    _print_task_preview(manifest)
+    if not _confirm("Run this batch now?", default=False):
+        print(f"Skipped. Run later with: python -m batchagent run {manifest_path}")
+        return 0
+    args = SimpleNamespace(
+        manifest=str(manifest_path),
+        limit=None,
+        retry_failed=False,
+        only=None,
+        plain=False,
+        no_progress=False,
+        focus="",
+        _used_rich_progress=False,
+    )
+    results = asyncio.run(_run_with_progress(args))
+    if getattr(args, "_used_rich_progress", False):
+        _print_rich_completion(str(manifest_path), results)
+    else:
+        _print_run_results(str(manifest_path), results)
+    return 0 if all(result.success for result in results) else 1
+
+
+def _choose_manifest_interactively() -> str:
+    candidates = _find_manifest_candidates()
+    try:
+        from rich.console import Console
+        from rich.prompt import Prompt
+        from rich.table import Table
+
+        console = Console()
+        if candidates:
+            table = Table(title="BatchAgent manifests")
+            table.add_column("#", justify="right")
+            table.add_column("Path")
+            for index, path in enumerate(candidates, start=1):
+                table.add_row(str(index), str(path))
+            console.print(table)
+            value = Prompt.ask("Choose manifest number or enter a path", default="1")
+        else:
+            value = Prompt.ask("Enter manifest path")
+    except ImportError:
+        for index, path in enumerate(candidates, start=1):
+            print(f"{index}. {path}")
+        value = input("Choose manifest number or enter a path: ").strip() if candidates else input("Enter manifest path: ").strip()
+
+    if value.isdigit() and candidates:
+        index = int(value)
+        if 1 <= index <= len(candidates):
+            return str(candidates[index - 1])
+    return value.strip()
+
+
+def _find_manifest_candidates() -> list[Path]:
+    roots = [Path.cwd()]
+    candidates: list[Path] = []
+    for root in roots:
+        for path in root.rglob("BATCHAGENT.md"):
+            parts = set(path.parts)
+            if ".batchagent" in parts or "__pycache__" in parts:
+                continue
+            candidates.append(path)
+    return sorted(candidates, key=lambda item: str(item).lower())
+
+
+def _confirm(prompt: str, default: bool = False) -> bool:
+    try:
+        from rich.prompt import Confirm
+
+        return bool(Confirm.ask(prompt, default=default))
+    except ImportError:
+        suffix = "Y/n" if default else "y/N"
+        value = input(f"{prompt} [{suffix}] ").strip().lower()
+        if not value:
+            return default
+        return value in {"y", "yes"}
+
+
+def _print_task_preview(manifest) -> None:
+    try:
+        from rich.console import Console
+        from rich.table import Table
+
+        table = Table(title="Tasks")
+        table.add_column("Status")
+        table.add_column("Task")
+        table.add_column("Kind")
+        table.add_column("Attempts", justify="right")
+        table.add_column("Input")
+        for task in manifest.tasks:
+            table.add_row(
+                task.status,
+                task.id,
+                task.kind,
+                str(task.attempts),
+                console_safe(truncate(json.dumps(task.input, ensure_ascii=False), 120)),
+            )
+        Console().print(table)
+    except ImportError:
+        for task in manifest.tasks:
+            print(f"{task.status}\t{task.id}\t{task.kind}\tattempts={task.attempts}")
+
+
+def _print_rich_completion(manifest_path: str, results) -> None:
+    failed = [result for result in results if not result.success]
+    if failed:
+        print(f"Batch finished with {len(failed)} failed task(s).")
+        print("Recovery options:")
+        print(f"  Inspect: python -m batchagent inspect {manifest_path} {failed[0].task_id}")
+        print(f"  Retry:   python -m batchagent retry {manifest_path} " + " ".join(result.task_id for result in failed))
+        print(f"  Run:     python -m batchagent run {manifest_path} --retry-failed")
+        return
+    print(f"Batch completed: {len(results)} task(s) done.")
 
 
 def _print_run_results(manifest_path: str, results) -> None:

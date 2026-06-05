@@ -142,6 +142,12 @@ Statuses:
 
 ## Commands
 
+Run without arguments to enter interactive mode. BatchAgent will discover `BATCHAGENT.md` files, show the task list, and ask before starting execution.
+
+```powershell
+python -m batchagent
+```
+
 Create a demo manifest:
 
 ```powershell
@@ -162,6 +168,8 @@ python -m batchagent run BATCHAGENT.md --limit 2
 
 `run` uses a Rich live dashboard by default when Rich is installed. The dashboard shows loaded, eligible, running, completed, failed, elapsed time, ETA, and the concrete running task ids.
 
+The dashboard uses the terminal alternate screen, so the running UI owns the terminal while active instead of filling scrollback. During execution, each task's `Detail` column shows the model output/tool activity tail; after completion it shows the submitted artifact path or run artifact record.
+
 Useful run options:
 
 ```powershell
@@ -170,6 +178,12 @@ python -m batchagent run BATCHAGENT.md --only task-id --retry-failed
 python -m batchagent run BATCHAGENT.md --plain
 python -m batchagent run BATCHAGENT.md --no-progress
 ```
+
+Dashboard keys:
+
+- `Up` / `Down`: move task focus.
+- `Enter`: open the focused task detail page.
+- `Esc`: return to overview.
 
 Show progress:
 
