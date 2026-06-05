@@ -5,7 +5,6 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 from .manifest import ManifestError, create_sample_manifest, load_manifest
 from .provider import create_provider
@@ -27,10 +26,15 @@ from .util import console_safe, truncate
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv:
-        return _interactive_main()
+        from .tui import run_tui
+
+        return run_tui()
 
     parser = argparse.ArgumentParser(prog="batchagent", description="Markdown-driven batch agent harness.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    tui_parser = subparsers.add_parser("tui", help="Start the full-screen interactive TUI.")
+    tui_parser.add_argument("manifest", nargs="?", default=None)
 
     init_parser = subparsers.add_parser("init", help="Create a sample manifest.")
     init_parser.add_argument("manifest", nargs="?", default="BATCHAGENT.md")
@@ -80,6 +84,10 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     try:
+        if args.command == "tui":
+            from .tui import run_tui
+
+            return run_tui(args.manifest)
         if args.command == "init":
             create_sample_manifest(args.manifest)
             print(f"created {args.manifest}")
@@ -167,115 +175,6 @@ async def _run_with_progress(args) -> list:
             progress_callback=state.handle_event,
         )
     )
-
-
-def _interactive_main() -> int:
-    manifest_path = _choose_manifest_interactively()
-    if not manifest_path:
-        return 1
-    manifest = load_manifest(manifest_path)
-    validate_manifest(manifest)
-    _print_manifest_summary(manifest)
-    _print_task_preview(manifest)
-    if not _confirm("Run this batch now?", default=False):
-        print(f"Skipped. Run later with: python -m batchagent run {manifest_path}")
-        return 0
-    args = SimpleNamespace(
-        manifest=str(manifest_path),
-        limit=None,
-        retry_failed=False,
-        only=None,
-        plain=False,
-        no_progress=False,
-        focus="",
-        _used_rich_progress=False,
-    )
-    results = asyncio.run(_run_with_progress(args))
-    if getattr(args, "_used_rich_progress", False):
-        _print_rich_completion(str(manifest_path), results)
-    else:
-        _print_run_results(str(manifest_path), results)
-    return 0 if all(result.success for result in results) else 1
-
-
-def _choose_manifest_interactively() -> str:
-    candidates = _find_manifest_candidates()
-    try:
-        from rich.console import Console
-        from rich.prompt import Prompt
-        from rich.table import Table
-
-        console = Console()
-        if candidates:
-            table = Table(title="BatchAgent manifests")
-            table.add_column("#", justify="right")
-            table.add_column("Path")
-            for index, path in enumerate(candidates, start=1):
-                table.add_row(str(index), str(path))
-            console.print(table)
-            value = Prompt.ask("Choose manifest number or enter a path", default="1")
-        else:
-            value = Prompt.ask("Enter manifest path")
-    except ImportError:
-        for index, path in enumerate(candidates, start=1):
-            print(f"{index}. {path}")
-        value = input("Choose manifest number or enter a path: ").strip() if candidates else input("Enter manifest path: ").strip()
-
-    if value.isdigit() and candidates:
-        index = int(value)
-        if 1 <= index <= len(candidates):
-            return str(candidates[index - 1])
-    return value.strip()
-
-
-def _find_manifest_candidates() -> list[Path]:
-    roots = [Path.cwd()]
-    candidates: list[Path] = []
-    for root in roots:
-        for path in root.rglob("BATCHAGENT.md"):
-            parts = set(path.parts)
-            if ".batchagent" in parts or "__pycache__" in parts:
-                continue
-            candidates.append(path)
-    return sorted(candidates, key=lambda item: str(item).lower())
-
-
-def _confirm(prompt: str, default: bool = False) -> bool:
-    try:
-        from rich.prompt import Confirm
-
-        return bool(Confirm.ask(prompt, default=default))
-    except ImportError:
-        suffix = "Y/n" if default else "y/N"
-        value = input(f"{prompt} [{suffix}] ").strip().lower()
-        if not value:
-            return default
-        return value in {"y", "yes"}
-
-
-def _print_task_preview(manifest) -> None:
-    try:
-        from rich.console import Console
-        from rich.table import Table
-
-        table = Table(title="Tasks")
-        table.add_column("Status")
-        table.add_column("Task")
-        table.add_column("Kind")
-        table.add_column("Attempts", justify="right")
-        table.add_column("Input")
-        for task in manifest.tasks:
-            table.add_row(
-                task.status,
-                task.id,
-                task.kind,
-                str(task.attempts),
-                console_safe(truncate(json.dumps(task.input, ensure_ascii=False), 120)),
-            )
-        Console().print(table)
-    except ImportError:
-        for task in manifest.tasks:
-            print(f"{task.status}\t{task.id}\t{task.kind}\tattempts={task.attempts}")
 
 
 def _print_rich_completion(manifest_path: str, results) -> None:

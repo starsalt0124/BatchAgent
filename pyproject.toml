@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Markdown-driven batch agent harness for repeatable task lists."
 requires-python = ">=3.11"
 authors = [{ name = "BatchAgent" }]
-dependencies = ["rich>=13.7"]
+dependencies = ["rich>=13.7", "textual>=8.0"]
 
 [project.scripts]
 batchagent = "batchagent.cli:main"

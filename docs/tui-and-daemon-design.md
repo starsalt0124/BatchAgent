@@ -2,15 +2,16 @@
 
 ## Current Implementation
 
-The current implementation is a single-process runner with a full-screen Rich TUI:
+The current implementation is a single-process runner with a full-screen Textual TUI:
 
-- `python -m batchagent` starts interactive mode, discovers manifests, previews tasks, and asks before execution.
+- `python -m batchagent` starts a persistent full-screen TUI.
+- `python -m batchagent tui <manifest>` starts the same TUI with a selected manifest.
 - `python -m batchagent run <manifest>` keeps direct non-interactive execution.
+- The bottom command input accepts `/show_batch`, `/run`, `/show_task`, `/retry`, `/rerun`, `/refresh`, and `/quit`.
 - The scheduler emits structured progress events.
-- The TUI consumes those events and renders an alternate-screen dashboard.
+- The TUI consumes those events and renders manifest, batch, run, and task pages.
 - While a task is running, the detail field shows model deltas and tool activity.
 - When a task completes, the detail field switches to the artifact path or artifact record.
-- The TUI supports task focus with `Up`/`Down`, a task detail page with `Enter`, and return to overview with `Esc`.
 - `--plain` and `--no-progress` remain available for logs and automation.
 
 This keeps execution deterministic: disabling the TUI does not change scheduling, tool calls, retries, or manifest writeback.
@@ -23,7 +24,7 @@ Recommended navigation model:
 2. Batch run page: current dashboard with task table, progress, ETA, and focused task summary.
 3. Task run page: model output tail, tool call timeline, artifact submission, errors, and links to persisted SQLite records.
 
-The current code implements pages 2 and 3 for one running manifest. Interactive startup is the seed for page 1.
+The current code implements these pages for local manifests in one process. The next daemon version should lift the same page model over multiple concurrent server-owned runs.
 
 ## Server/Client Singleton Direction
 
@@ -43,4 +44,3 @@ This should be implemented after the event stream stabilizes. The current event 
 ## Safety Notes
 
 The server must never make tool approval interactive per model turn in unattended batch mode. It should keep the current manifest-level tool allowlist, command allowlist, command blacklist, workspace path policy, clean environment policy, and artifact validation.
-

@@ -142,10 +142,28 @@ Statuses:
 
 ## Commands
 
-Run without arguments to enter interactive mode. BatchAgent will discover `BATCHAGENT.md` files, show the task list, and ask before starting execution.
+Run without arguments to enter the full-screen Textual TUI. BatchAgent will discover `BATCHAGENT.md` files and keep a command input at the bottom of the screen.
 
 ```powershell
 python -m batchagent
+```
+
+Core TUI commands:
+
+```text
+/show_batch <number|path>
+/run <number|path> [--only task-id] [--retry-failed]
+/show_task <task-id>
+/retry <task-id|all>
+/rerun <task-id>
+/refresh
+/quit
+```
+
+You can also start the same TUI with an explicit manifest:
+
+```powershell
+python -m batchagent tui tests\date_survey\BATCHAGENT.md
 ```
 
 Create a demo manifest:
