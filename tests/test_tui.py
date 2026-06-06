@@ -9,7 +9,9 @@ from pathlib import Path
 from textual.widgets import Input
 
 from batchagent.manifest import create_sample_manifest
-from batchagent.tui import BatchAgentTui
+from batchagent.scheduler import state_db_path
+from batchagent.store import SessionStore
+from batchagent.tui import BatchAgentTui, TaskDetailScreen
 
 
 class TuiTests(unittest.TestCase):
@@ -75,6 +77,29 @@ class TuiTests(unittest.TestCase):
             finally:
                 os.chdir(previous)
 
+    def test_up_down_selects_command_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            try:
+                os.chdir(tmp)
+                create_sample_manifest("BATCHAGENT.md")
+
+                async def run() -> None:
+                    app = BatchAgentTui()
+                    async with app.run_test(size=(100, 30)) as pilot:
+                        command = app.query_one("#command", Input)
+                        command.focus()
+                        command.value = "/"
+                        await pilot.press("down")
+                        await pilot.press("tab")
+                        self.assertEqual(command.value, "/run")
+                        self.assertTrue(command.has_focus)
+                        await app.handle_command("/quit")
+
+                asyncio.run(run())
+            finally:
+                os.chdir(previous)
+
     def test_command_palette_describes_slash_commands(self) -> None:
         app = BatchAgentTui()
         lines = app.command_palette_lines("/")
@@ -93,6 +118,55 @@ class TuiTests(unittest.TestCase):
 
                 self.assertEqual(app.history_rows(), [])
                 self.assertFalse((Path(tmp) / ".batchagent").exists())
+            finally:
+                os.chdir(previous)
+
+    def test_task_detail_reads_persisted_agent_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            try:
+                os.chdir(tmp)
+                create_sample_manifest("BATCHAGENT.md")
+                app = BatchAgentTui()
+                app.discover_manifests()
+                app.load_manifest_by_token("1")
+                manifest = app.require_manifest()
+
+                store = SessionStore(state_db_path(manifest))
+                try:
+                    run_dir = Path(tmp) / ".batchagent" / "runs" / "demo-1-run-a"
+                    store.start_run("run-a", "demo-1", 1, run_dir)
+                    store.add_message("run-a", 1, "assistant", "agent output line\nsecond line", {"role": "assistant"})
+                    store.finish_run("run-a", "done")
+                finally:
+                    store.close()
+
+                detail = app.task_detail_text_for("demo-1")
+                self.assertIn("latest persisted run:", detail)
+                self.assertIn("agent output line\nsecond line", detail)
+            finally:
+                os.chdir(previous)
+
+    def test_show_task_opens_modal_and_escape_closes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            try:
+                os.chdir(tmp)
+                create_sample_manifest("BATCHAGENT.md")
+
+                async def run() -> None:
+                    app = BatchAgentTui()
+                    async with app.run_test(size=(100, 30)) as pilot:
+                        await app.handle_command("/show_batch 1")
+                        await app.handle_command("/show_task demo-1")
+                        await pilot.pause()
+                        self.assertIsInstance(app.screen, TaskDetailScreen)
+                        await pilot.press("escape")
+                        await pilot.pause()
+                        self.assertNotIsInstance(app.screen, TaskDetailScreen)
+                        await app.handle_command("/quit")
+
+                asyncio.run(run())
             finally:
                 os.chdir(previous)
 

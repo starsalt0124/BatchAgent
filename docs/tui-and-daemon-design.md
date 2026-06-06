@@ -9,9 +9,11 @@ The current implementation is a single-process runner with a full-screen Textual
 - `python -m batchagent run <manifest>` keeps direct non-interactive execution.
 - The bottom command input accepts `/show_batch`, `/run`, `/show_task`, `/history`, `/retry`, `/rerun`, `/refresh`, and `/quit`.
 - Typing `/` opens command candidates with usage examples and descriptions.
-- `Tab` completes the current command, discovered manifest, option, or task id from the selected manifest.
+- `Up` / `Down` selects a command candidate and `Tab` accepts it.
+- Completion covers the current command, discovered manifest, option, or task id from the selected manifest.
 - The left sidebar is batch context only: discovered manifests and the current selected batch.
 - The top panel repeats the selected batch so every page has explicit batch context.
+- `/show_task <task-id>` opens an independent task detail modal. It shows live progress when available and falls back to persisted SQLite messages, tool events, artifacts, and errors for prior runs.
 - The scheduler emits structured progress events.
 - The TUI consumes those events and renders manifest, batch, run, and task pages.
 - While a task is running, the detail field shows model deltas and tool activity.

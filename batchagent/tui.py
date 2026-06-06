@@ -11,6 +11,7 @@ from rich.panel import Panel
 from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
 from .manifest import ManifestError, load_manifest
@@ -47,7 +48,68 @@ class CommandInput(Input):
             if complete is not None:
                 complete()
             return
+        if event.key in {"up", "down"}:
+            move = getattr(self.app, "action_move_candidate", None)
+            if move is not None and move(-1 if event.key == "up" else 1):
+                event.stop()
+                event.prevent_default()
+                return
         await super()._on_key(event)
+
+
+class TaskDetailScreen(ModalScreen[None]):
+    CSS = """
+    TaskDetailScreen {
+        align: center middle;
+    }
+
+    #task_modal {
+        width: 92%;
+        height: 88%;
+        border: thick $primary;
+        background: $surface;
+    }
+
+    #task_modal_title {
+        height: 3;
+        border-bottom: solid $surface;
+        padding: 0 1;
+    }
+
+    #task_modal_body {
+        height: 1fr;
+        padding: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "close", "Close"),
+        ("ctrl+c", "close", "Close"),
+    ]
+
+    def __init__(self, task_id: str):
+        super().__init__()
+        self.task_id = task_id
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="task_modal"):
+            yield Static("", id="task_modal_title")
+            yield RichLog(id="task_modal_body", wrap=True, highlight=False)
+
+    def on_mount(self) -> None:
+        self.refresh_content()
+        self.set_interval(0.5, self.refresh_content)
+
+    def refresh_content(self) -> None:
+        title = self.query_one("#task_modal_title", Static)
+        body = self.query_one("#task_modal_body", RichLog)
+        title.update(f"Task Detail: {self.task_id}\nEsc closes this window.")
+        body.clear()
+        detail_text = getattr(self.app, "task_detail_text_for")(self.task_id)
+        body.write(Panel(detail_text, title=self.task_id))
+
+    def action_close(self) -> None:
+        self.dismiss()
 
 
 class BatchAgentTui(App[None]):
@@ -129,10 +191,10 @@ class BatchAgentTui(App[None]):
         self.run_results: list[Any] = []
         self.ui_thread = 0
         self.history_task_id = ""
-        self._completion_base = ""
         self._completion_value = ""
         self._completion_candidates: list[str] = []
         self._completion_index = 0
+        self._completion_input = ""
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -174,8 +236,6 @@ class BatchAgentTui(App[None]):
             self.render_batch()
         elif self.page == "run":
             self.render_run()
-        elif self.page == "task":
-            self.render_task()
         elif self.page == "history":
             self.render_history()
 
@@ -338,10 +398,6 @@ class BatchAgentTui(App[None]):
             )
         self.render_focused_task_detail()
 
-    def render_task(self) -> None:
-        self.render_run() if self.progress_state else self.render_batch()
-        self.render_focused_task_detail(full=True)
-
     def render_history(self) -> None:
         manifest = self.require_manifest()
         rows = self.history_rows(self.history_task_id or None)
@@ -429,24 +485,38 @@ class BatchAgentTui(App[None]):
         command_input = self.query_one("#command", Input)
         command_input.focus()
         current = command_input.value
-        if current == self._completion_value and self._completion_candidates:
-            self._completion_index = (self._completion_index + 1) % len(self._completion_candidates)
-            base = self._completion_base
-            candidates = self._completion_candidates
-        else:
-            base = current
-            candidates = self.completion_candidates(base)
-            self._completion_base = base
-            self._completion_candidates = candidates
-            self._completion_index = 0
+        candidates = self.refresh_completion_candidates(current)
         if not candidates:
             self.notify("no completion", severity="warning")
             self.reset_completion()
             return
+        base = self._completion_input or current
         next_value = self.apply_completion(base, candidates[self._completion_index])
         self._completion_value = next_value
         command_input.value = next_value
         command_input.cursor_position = len(next_value)
+        self.render_command_palette(next_value)
+
+    def action_move_candidate(self, offset: int) -> bool:
+        command_input = self.query_one("#command", Input)
+        candidates = self.refresh_completion_candidates(command_input.value)
+        if not candidates:
+            return False
+        self._completion_index = (self._completion_index + offset) % len(candidates)
+        self.render_command_palette(command_input.value)
+        return True
+
+    def refresh_completion_candidates(self, value: str, *, reset_index: bool = False) -> list[str]:
+        candidates = self.completion_candidates(value)
+        if value != self._completion_input or candidates != self._completion_candidates or reset_index:
+            self._completion_input = value
+            self._completion_candidates = candidates
+            self._completion_index = 0
+        if self._completion_candidates:
+            self._completion_index %= len(self._completion_candidates)
+        else:
+            self._completion_index = 0
+        return self._completion_candidates
 
     def render_command_palette(self, value: str) -> None:
         palette = self.query_one("#command_palette", Static)
@@ -461,12 +531,16 @@ class BatchAgentTui(App[None]):
     def command_palette_lines(self, value: str) -> list[str]:
         if not value.startswith("/"):
             return []
-        candidates = self.completion_candidates(value)
-        if value.strip() == "/":
-            return [self.describe_candidate(value, name) for name in COMMANDS]
+        candidates = self.refresh_completion_candidates(value)
         if not candidates:
             return ["No matching command, batch, option, or task."]
-        return [self.describe_candidate(value, candidate) for candidate in candidates[:8]]
+        lines: list[str] = []
+        for index, candidate in enumerate(candidates[:8]):
+            marker = ">" if index == self._completion_index else " "
+            lines.append(f"{marker} {self.describe_candidate(value, candidate)}")
+        if len(candidates) > 8:
+            lines.append(f"  ... {len(candidates) - 8} more")
+        return lines
 
     def describe_candidate(self, value: str, candidate: str) -> str:
         if candidate in COMMAND_META:
@@ -607,10 +681,10 @@ class BatchAgentTui(App[None]):
             return path.as_posix()
 
     def reset_completion(self) -> None:
-        self._completion_base = ""
         self._completion_value = ""
         self._completion_candidates = []
         self._completion_index = 0
+        self._completion_input = ""
 
     async def handle_command(self, command: str) -> None:
         if not command.startswith("/"):
@@ -669,8 +743,15 @@ class BatchAgentTui(App[None]):
         if not args:
             raise RuntimeError("Usage: /show_task <task-id>")
         self.focus_task_id = args[0]
-        self.page = "task"
-        self.render_page()
+        self.open_task_detail(args[0])
+
+    def open_task_detail(self, task_id: str) -> None:
+        if self.task_for_token(task_id) is None and not (self.progress_state and task_id in self.progress_state.tasks):
+            raise RuntimeError(f"task not found: {task_id}")
+        self.focus_task_id = task_id
+        if self.progress_state is not None:
+            self.progress_state.focus_task_id = task_id
+        self.push_screen(TaskDetailScreen(task_id))
 
     def command_history(self, args: list[str]) -> None:
         if args and args[0] not in {"all", "*"}:
@@ -838,6 +919,21 @@ class BatchAgentTui(App[None]):
             return None
         return self.progress_state.tasks.get(self.focus_task_id)
 
+    def task_progress_for(self, task_id: str):
+        if self.progress_state is None:
+            return None
+        return self.progress_state.tasks.get(task_id)
+
+    def task_detail_text_for(self, task_id: str) -> str:
+        task = self.task_progress_for(task_id)
+        if task is not None:
+            return self.task_progress_text(task, full=True)
+        manifest = self.require_manifest()
+        row = next((item for item in manifest.tasks if item.id == task_id), None)
+        if row is None:
+            return console_safe(f"Task not found: {task_id}")
+        return self.task_row_text(row, include_history=True)
+
     def task_progress_text(self, task, full: bool = False) -> str:
         base = [
             f"status: {task.status}",
@@ -849,22 +945,69 @@ class BatchAgentTui(App[None]):
             f"detail: {task.detail}",
         ]
         if full:
-            base.extend(["", "events:", *task.events[-20:], "", "model output:", task.stream_text[-6000:]])
+            events = task.events[-40:] or ["(no tool events yet)"]
+            stream = task.stream_text[-12000:] if task.stream_text else "(no model output captured yet)"
+            base.extend(["", "events:", *events, "", "model output:", stream])
         return console_safe("\n".join(base))
 
-    def task_row_text(self, task: Task) -> str:
-        return console_safe(
-            "\n".join(
-                [
-                    f"status: {task.status}",
-                    f"kind: {task.kind}",
-                    f"attempts: {task.attempts}",
-                    f"result: {task.result}",
-                    f"error: {task.error}",
-                    f"input: {json.dumps(task.input, ensure_ascii=False, indent=2)}",
-                ]
-            )
-        )
+    def task_row_text(self, task: Task, *, include_history: bool = False) -> str:
+        lines = [
+            f"status: {task.status}",
+            f"kind: {task.kind}",
+            f"attempts: {task.attempts}",
+            f"result: {task.result}",
+            f"error: {task.error}",
+            f"input: {json.dumps(task.input, ensure_ascii=False, indent=2)}",
+        ]
+        if include_history:
+            lines.extend(["", *self.persisted_task_output_lines(task.id)])
+        return console_safe("\n".join(lines))
+
+    def persisted_task_output_lines(self, task_id: str) -> list[str]:
+        manifest = self.require_manifest()
+        db_path = state_db_path(manifest)
+        if not db_path.exists():
+            return ["persisted run output:", "(no state database yet)"]
+        store = SessionStore(db_path)
+        try:
+            runs = store.task_runs(task_id)
+            if not runs:
+                return ["persisted run output:", "(no persisted runs for this task yet)"]
+            run = runs[0]
+            run_id = run["run_id"]
+            lines = [
+                "latest persisted run:",
+                f"run_id: {run_id}",
+                f"attempt: {run['attempt']}",
+                f"status: {run['status']}",
+                f"run_dir: {run['run_dir']}",
+                f"started_at: {run['started_at']}",
+                f"finished_at: {run['finished_at'] or ''}",
+                f"error: {run['error']}",
+            ]
+            artifacts = store.run_artifacts(run_id)
+            if artifacts:
+                lines.extend(["", "artifacts:", json.dumps(artifacts, ensure_ascii=False, indent=2)])
+            tool_events = store.run_tool_events(run_id, limit=20)
+            if tool_events:
+                lines.append("")
+                lines.append("tool events:")
+                for event in tool_events:
+                    error = f" error={event['error']}" if event["error"] else ""
+                    lines.append(f"  #{event['seq']} {event['tool_name']}{error}")
+                    lines.append(f"    args: {truncate(json.dumps(event['arguments'], ensure_ascii=False), 500)}")
+            messages = store.run_messages(run_id, limit=20)
+            assistant_or_tool = [message for message in messages if message["role"] in {"assistant", "tool"}]
+            lines.extend(["", "agent output:"])
+            if not assistant_or_tool:
+                lines.append("(no assistant/tool messages persisted)")
+            for message in assistant_or_tool:
+                content = message["content"] or "(empty)"
+                lines.append(f"[{message['seq']} {message['role']} {message['created_at']}]")
+                lines.append(content[-4000:] if len(content) > 4000 else content)
+            return lines
+        finally:
+            store.close()
 
 
 def run_tui(start_manifest: str | None = None) -> int:

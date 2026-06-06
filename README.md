@@ -170,7 +170,9 @@ Core TUI commands:
 /quit
 ```
 
-Type `/` in the TUI command input to show commands with usage examples and descriptions. Press `Tab` to complete the current command, discovered batch manifest, option, or task id from the selected manifest.
+Type `/` in the TUI command input to show commands with usage examples and descriptions. Use `Up` / `Down` to select a candidate and `Tab` to accept it. Completion covers commands, discovered batch manifests, options, and task ids from the selected manifest.
+
+`/show_task <task-id>` opens an independent task detail window. It shows live model output and tool activity for running tasks; for finished or restarted sessions it reads the latest persisted run messages, tool events, artifacts, and errors from SQLite. Press `Esc` to close the task detail window.
 
 You can also start the same TUI with an explicit manifest:
 
