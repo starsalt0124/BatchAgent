@@ -11,6 +11,26 @@ from batchagent.tui import BatchAgentTui
 
 
 class TuiTests(unittest.TestCase):
+    def test_completion_candidates_include_commands_manifests_and_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            try:
+                os.chdir(tmp)
+                create_sample_manifest("BATCHAGENT.md")
+                app = BatchAgentTui()
+                app.discover_manifests()
+                app.load_manifest_by_token("1")
+
+                self.assertIn("/show_batch", app.completion_candidates("/sho"))
+                self.assertIn("1", app.completion_candidates("/run "))
+                self.assertIn("BATCHAGENT.md", app.completion_candidates("/show_batch B"))
+                self.assertIn("demo", app.completion_candidates("/show_batch d"))
+                self.assertIn("demo-1", app.completion_candidates("/show_task demo"))
+                self.assertIn("demo-2", app.completion_candidates("/run --only demo"))
+                self.assertIn("all", app.completion_candidates("/history "))
+            finally:
+                os.chdir(previous)
+
     def test_tui_loads_manifest_and_switches_batch_page(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             previous = Path.cwd()
@@ -31,7 +51,21 @@ class TuiTests(unittest.TestCase):
             finally:
                 os.chdir(previous)
 
+    def test_history_rows_do_not_create_state_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            try:
+                os.chdir(tmp)
+                create_sample_manifest("BATCHAGENT.md")
+                app = BatchAgentTui()
+                app.discover_manifests()
+                app.load_manifest_by_token("1")
+
+                self.assertEqual(app.history_rows(), [])
+                self.assertFalse((Path(tmp) / ".batchagent").exists())
+            finally:
+                os.chdir(previous)
+
 
 if __name__ == "__main__":
     unittest.main()
-

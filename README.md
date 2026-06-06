@@ -154,11 +154,14 @@ Core TUI commands:
 /show_batch <number|path>
 /run <number|path> [--only task-id] [--retry-failed]
 /show_task <task-id>
+/history [task-id]
 /retry <task-id|all>
 /rerun <task-id>
 /refresh
 /quit
 ```
+
+Press `Tab` in the TUI command input to complete command names, discovered batch manifests, and task ids from the selected manifest.
 
 You can also start the same TUI with an explicit manifest:
 
@@ -183,6 +186,8 @@ Run tasks:
 ```powershell
 python -m batchagent run BATCHAGENT.md --limit 2
 ```
+
+Every task attempt gets a new `run_id` and a new directory under `.batchagent/runs/<task-id>-<run_id>`. Running an already-run batch updates the manifest's latest task status/result, but it does not overwrite existing run directories, artifacts, or SQLite history.
 
 `run` uses a Rich live dashboard by default when Rich is installed. The dashboard shows loaded, eligible, running, completed, failed, elapsed time, ETA, and the concrete running task ids.
 

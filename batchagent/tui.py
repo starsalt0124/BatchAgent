@@ -16,8 +16,24 @@ from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 from .manifest import ManifestError, load_manifest
 from .models import Manifest, Task
 from .progress import ProgressState, _format_seconds
-from .scheduler import mark_tasks_for_retry, rerun_tasks, run_manifest, status, validate_manifest
+from .scheduler import mark_tasks_for_retry, rerun_tasks, run_manifest, state_db_path, status, validate_manifest
+from .store import SessionStore
 from .util import console_safe, truncate
+
+
+COMMANDS = [
+    "/show_batch",
+    "/show_task",
+    "/history",
+    "/run",
+    "/retry",
+    "/rerun",
+    "/refresh",
+    "/show_home",
+    "/help",
+    "/quit",
+    "/exit",
+]
 
 
 class BatchAgentTui(App[None]):
@@ -67,6 +83,7 @@ class BatchAgentTui(App[None]):
         ("ctrl+q", "quit", "Quit"),
         ("f1", "help", "Help"),
         ("escape", "show_batch", "Batch"),
+        ("tab", "complete_command", "Complete"),
     ]
 
     def __init__(self, start_manifest: str | None = None):
@@ -81,6 +98,11 @@ class BatchAgentTui(App[None]):
         self.run_task: asyncio.Task | None = None
         self.run_results: list[Any] = []
         self.ui_thread = 0
+        self.history_task_id = ""
+        self._completion_base = ""
+        self._completion_value = ""
+        self._completion_candidates: list[str] = []
+        self._completion_index = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -122,9 +144,13 @@ class BatchAgentTui(App[None]):
             self.render_run()
         elif self.page == "task":
             self.render_task()
+        elif self.page == "history":
+            self.render_history()
 
     def render_sidebar(self) -> None:
-        self.query_one("#side_title", Static).update("BatchAgent\n\n/show_batch <#>\n/run <#|path>\n/show_task <id>\n/quit")
+        self.query_one("#side_title", Static).update(
+            "BatchAgent\n\n/show_batch <#>\n/run <#|path>\n/show_task <id>\n/history [id]\nTab complete\n/quit"
+        )
         table = self.query_one("#manifest_table", DataTable)
         table.clear(columns=True)
         table.add_columns("#", "Manifest", "State")
@@ -160,8 +186,11 @@ class BatchAgentTui(App[None]):
                 "  /show_batch <number|path>",
                 "  /run <number|path> [--only task-id] [--retry-failed]",
                 "  /show_task <task-id>",
+                "  /history [task-id]",
                 "  /refresh",
                 "  /quit",
+                "",
+                "Tab completes commands, manifest tokens, and task ids.",
             ]
         )
 
@@ -200,9 +229,12 @@ class BatchAgentTui(App[None]):
                 "  /run                       run eligible tasks in this manifest",
                 "  /run --only <task-id>       run one task",
                 "  /show_task <task-id>        inspect task details",
+                "  /history [task-id]          show persisted run history",
                 "  /retry <task-id|all>        mark failed task(s) retry",
                 "  /rerun <task-id>            reset task to todo",
                 "  /show_home                  manifest list",
+                "",
+                "Every /run attempt creates a new .batchagent/runs/<task>-<run_id> directory; old results stay available in /history.",
             ]
         )
 
@@ -221,6 +253,7 @@ class BatchAgentTui(App[None]):
                         f"Run: {state.manifest.path}",
                         f"loaded={state.total_tasks} eligible={state.eligible_tasks} running={running} queued={queued} done={done} failed={failed}",
                         f"elapsed={_format_seconds(state.elapsed())} eta={'unknown' if eta is None else _format_seconds(eta)}",
+                        "run dirs are unique per attempt; existing task results are not overwritten on disk",
                     ]
                 ),
                 title="Running Batch",
@@ -246,6 +279,41 @@ class BatchAgentTui(App[None]):
         self.render_run() if self.progress_state else self.render_batch()
         self.render_focused_task_detail(full=True)
 
+    def render_history(self) -> None:
+        manifest = self.require_manifest()
+        rows = self.history_rows(self.history_task_id or None)
+        title_lines = [
+            f"Manifest: {manifest.path}",
+            f"History: {self.history_task_id or 'all tasks'}",
+            "Each run has an immutable run_id and a separate run directory.",
+        ]
+        self.query_one("#title", Static).update(Panel("\n".join(title_lines), title="Run History"))
+        table = self.query_one("#table", DataTable)
+        table.clear(columns=True)
+        table.add_columns("Task", "Run ID", "Attempt", "Status", "Started", "Finished", "Run Dir", "Error")
+        for row in rows:
+            table.add_row(
+                row["task_id"],
+                row["run_id"],
+                str(row["attempt"]),
+                row["status"],
+                row["started_at"],
+                row["finished_at"] or "",
+                truncate(row["run_dir"], 80),
+                truncate(row["error"], 80),
+                key=row["run_id"],
+            )
+        self.set_detail(
+            [
+                f"history rows: {len(rows)}",
+                "Commands:",
+                "  /history                 show all recent runs for this manifest",
+                "  /history <task-id>       show run history for one task",
+                "  /show_task <task-id>     inspect current manifest row and live details",
+                "  /run [--only task-id]    create a new run directory and keep prior results",
+            ]
+        )
+
     def render_focused_task_detail(self, full: bool = False) -> None:
         detail = self.query_one("#detail", RichLog)
         detail.clear()
@@ -267,12 +335,149 @@ class BatchAgentTui(App[None]):
         for line in lines:
             detail.write(line)
 
+    def history_rows(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        manifest = self.require_manifest()
+        db_path = state_db_path(manifest)
+        if not db_path.exists():
+            return []
+        store = SessionStore(db_path)
+        try:
+            return store.task_runs(task_id) if task_id else store.all_runs()
+        finally:
+            store.close()
+
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         command = event.value.strip()
         event.input.value = ""
+        self.reset_completion()
         if not command:
             return
         await self.handle_command(command)
+
+    def action_complete_command(self) -> None:
+        command_input = self.query_one("#command", Input)
+        command_input.focus()
+        current = command_input.value
+        if current == self._completion_value and self._completion_candidates:
+            self._completion_index = (self._completion_index + 1) % len(self._completion_candidates)
+            base = self._completion_base
+            candidates = self._completion_candidates
+        else:
+            base = current
+            candidates = self.completion_candidates(base)
+            self._completion_base = base
+            self._completion_candidates = candidates
+            self._completion_index = 0
+        if not candidates:
+            self.notify("no completion", severity="warning")
+            self.reset_completion()
+            return
+        next_value = self.apply_completion(base, candidates[self._completion_index])
+        self._completion_value = next_value
+        command_input.value = next_value
+        command_input.cursor_position = len(next_value)
+
+    def completion_candidates(self, text: str) -> list[str]:
+        before, token = self.split_completion_token(text)
+        command = self.command_name_for_completion(before, token)
+        if command is None:
+            return self.filter_candidates(COMMANDS, token)
+        if command in {"/show_batch"}:
+            return self.filter_candidates(self.manifest_completion_tokens(), token)
+        if command in {"/show_task", "/retry", "/rerun", "/history"}:
+            candidates = self.task_completion_tokens()
+            if command in {"/retry", "/history"}:
+                candidates = ["all", *candidates]
+            return self.filter_candidates(candidates, token)
+        if command == "/run":
+            return self.run_completion_candidates(before, token)
+        return []
+
+    def run_completion_candidates(self, before: str, token: str) -> list[str]:
+        tokens = before.strip().split()
+        if tokens and tokens[-1] == "--only":
+            return self.filter_candidates(self.task_completion_tokens(), token)
+        option_candidates = ["--only", "--retry-failed"]
+        consumed_manifest = any(not item.startswith("-") for item in tokens[1:] if item != "--only")
+        if token.startswith("-"):
+            return self.filter_candidates(option_candidates, token)
+        candidates = option_candidates if consumed_manifest or self.selected_manifest else []
+        if not consumed_manifest:
+            candidates = [*self.manifest_completion_tokens(), *candidates]
+        return self.filter_candidates(candidates, token)
+
+    def command_name_for_completion(self, before: str, token: str) -> str | None:
+        tokens = before.strip().split()
+        if not tokens:
+            if token.startswith("/") and " " not in before:
+                return None
+            return None
+        command = tokens[0].lower()
+        if command not in COMMANDS:
+            return None
+        return command
+
+    def split_completion_token(self, text: str) -> tuple[str, str]:
+        if not text:
+            return "", ""
+        if text[-1].isspace():
+            return text, ""
+        stripped = text.rstrip()
+        index = max(stripped.rfind(" "), stripped.rfind("\t"))
+        if index == -1:
+            return "", stripped
+        return stripped[: index + 1], stripped[index + 1 :]
+
+    def apply_completion(self, base: str, candidate: str) -> str:
+        before, _token = self.split_completion_token(base)
+        return before + self.quote_completion_token(candidate)
+
+    def quote_completion_token(self, token: str) -> str:
+        if not token or any(char.isspace() for char in token) or "\\" in token:
+            return shlex.quote(token)
+        return token
+
+    def filter_candidates(self, candidates: list[str], prefix: str) -> list[str]:
+        seen: set[str] = set()
+        matches: list[str] = []
+        prefix_lower = prefix.lower()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            if candidate.lower().startswith(prefix_lower):
+                seen.add(candidate)
+                matches.append(candidate)
+        return matches
+
+    def manifest_completion_tokens(self) -> list[str]:
+        tokens: list[str] = []
+        for index, path in enumerate(self.manifest_paths, start=1):
+            tokens.append(str(index))
+            tokens.append(self.display_manifest_path(path))
+            tokens.append(path.parent.name)
+            try:
+                tokens.append(load_manifest(path).config.name)
+            except Exception:
+                pass
+        return [token for token in tokens if token]
+
+    def task_completion_tokens(self) -> list[str]:
+        manifest = self.selected_manifest
+        if manifest is None:
+            return []
+        return [task.id for task in manifest.tasks]
+
+    def display_manifest_path(self, path: Path) -> str:
+        try:
+            return path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+        except ValueError:
+            return path.as_posix()
+
+    def reset_completion(self) -> None:
+        self._completion_base = ""
+        self._completion_value = ""
+        self._completion_candidates = []
+        self._completion_index = 0
 
     async def handle_command(self, command: str) -> None:
         if not command.startswith("/"):
@@ -305,6 +510,8 @@ class BatchAgentTui(App[None]):
                 self.command_show_batch(args)
             elif name == "/show_task":
                 self.command_show_task(args)
+            elif name == "/history":
+                self.command_history(args)
             elif name == "/run":
                 await self.command_run(args)
             elif name == "/retry":
@@ -332,6 +539,15 @@ class BatchAgentTui(App[None]):
         self.page = "task"
         self.render_page()
 
+    def command_history(self, args: list[str]) -> None:
+        if args and args[0] not in {"all", "*"}:
+            self.history_task_id = args[0]
+            self.focus_task_id = args[0]
+        else:
+            self.history_task_id = ""
+        self.page = "history"
+        self.render_page()
+
     async def command_run(self, args: list[str]) -> None:
         if self.run_task and not self.run_task.done():
             raise RuntimeError("A batch is already running in this TUI.")
@@ -343,6 +559,7 @@ class BatchAgentTui(App[None]):
         state = ProgressState.from_manifest(manifest, focus_task_id=only or self.focus_task_id)
         self.progress_state = state
         self.focus_task_id = state.focus_task_id
+        self.history_task_id = ""
         self.page = "run"
         self.render_page()
         task_ids = {only} if only else None
@@ -442,15 +659,35 @@ class BatchAgentTui(App[None]):
             if 1 <= index <= len(self.manifest_paths):
                 return self.manifest_paths[index - 1]
             raise RuntimeError(f"manifest index out of range: {token}")
-        return Path(token)
+        direct = Path(token)
+        if direct.exists():
+            return direct
+        matches: list[Path] = []
+        for path in self.manifest_paths:
+            if token in {self.display_manifest_path(path), path.parent.name, str(path)}:
+                matches.append(path)
+                continue
+            try:
+                if load_manifest(path).config.name == token:
+                    matches.append(path)
+            except Exception:
+                pass
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise RuntimeError(f"ambiguous manifest token: {token}")
+        return direct
 
     def load_manifest(self, path: Path) -> None:
         manifest = load_manifest(path)
         validate_manifest(manifest)
         self.selected_manifest = manifest
         self.selected_manifest_path = manifest.path
-        if not self.focus_task_id and manifest.tasks:
+        task_ids = {task.id for task in manifest.tasks}
+        if manifest.tasks and self.focus_task_id not in task_ids:
             self.focus_task_id = manifest.tasks[0].id
+        if self.history_task_id and self.history_task_id not in task_ids:
+            self.history_task_id = ""
 
     def require_manifest(self) -> Manifest:
         if self.selected_manifest is None:

@@ -7,11 +7,13 @@ The current implementation is a single-process runner with a full-screen Textual
 - `python -m batchagent` starts a persistent full-screen TUI.
 - `python -m batchagent tui <manifest>` starts the same TUI with a selected manifest.
 - `python -m batchagent run <manifest>` keeps direct non-interactive execution.
-- The bottom command input accepts `/show_batch`, `/run`, `/show_task`, `/retry`, `/rerun`, `/refresh`, and `/quit`.
+- The bottom command input accepts `/show_batch`, `/run`, `/show_task`, `/history`, `/retry`, `/rerun`, `/refresh`, and `/quit`.
+- `Tab` completes command names, discovered manifests, and task ids from the selected manifest.
 - The scheduler emits structured progress events.
 - The TUI consumes those events and renders manifest, batch, run, and task pages.
 - While a task is running, the detail field shows model deltas and tool activity.
 - When a task completes, the detail field switches to the artifact path or artifact record.
+- Each task attempt creates a unique `.batchagent/runs/<task>-<run_id>` directory. Re-running a batch updates the latest manifest row but keeps previous run directories, artifacts, and SQLite history.
 - `--plain` and `--no-progress` remain available for logs and automation.
 
 This keeps execution deterministic: disabling the TUI does not change scheduling, tool calls, retries, or manifest writeback.
@@ -23,6 +25,7 @@ Recommended navigation model:
 1. Batch list page: multiple manifests/batch runs, their state, start/stop/recover actions.
 2. Batch run page: current dashboard with task table, progress, ETA, and focused task summary.
 3. Task run page: model output tail, tool call timeline, artifact submission, errors, and links to persisted SQLite records.
+4. History page: persisted run records for all tasks or one selected task, including run id, attempt, status, timestamps, run directory, and error.
 
 The current code implements these pages for local manifests in one process. The next daemon version should lift the same page model over multiple concurrent server-owned runs.
 

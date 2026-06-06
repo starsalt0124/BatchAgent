@@ -152,9 +152,33 @@ class SessionStore:
             SELECT run_id, task_id, attempt, status, run_dir, started_at, finished_at, error
             FROM runs
             WHERE task_id = ?
-            ORDER BY started_at DESC
+            ORDER BY started_at DESC, rowid DESC
             """,
             (task_id,),
+        )
+        return [
+            {
+                "run_id": run_id,
+                "task_id": task_id,
+                "attempt": attempt,
+                "status": status,
+                "run_dir": run_dir,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "error": error or "",
+            }
+            for run_id, task_id, attempt, status, run_dir, started_at, finished_at, error in cursor.fetchall()
+        ]
+
+    def all_runs(self, limit: int = 200) -> list[dict[str, Any]]:
+        cursor = self.conn.execute(
+            """
+            SELECT run_id, task_id, attempt, status, run_dir, started_at, finished_at, error
+            FROM runs
+            ORDER BY started_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            (limit,),
         )
         return [
             {
