@@ -21,6 +21,7 @@ The resulting architecture is intentionally a harness around an OpenAI-compatibl
 Markdown manifest
   -> parser
   -> scheduler
+  -> Batch Work (`work_id`)
   -> per-task lease
   -> agent loop
   -> tool calls
@@ -75,6 +76,23 @@ tools = ["read_file", "write_file", "web_search", "web_fetch", "submit_artifact"
 ```
 
 Only the marked table is rewritten during execution. Free-form notes outside the markers are preserved.
+
+Terminology:
+
+- Batch Config: the manifest file and task table.
+- Batch Work: one scheduler invocation of a Batch Config. It has a `work_id`.
+- Task Run: one task attempt inside a Batch Work. It has a task-level `run_id`.
+
+Batch Configs may declare runtime variables:
+
+```toml
+run_variables = [
+  { name = "market", label = "Market scope", required = true },
+  { name = "as_of_date", label = "As-of date", default = "CURR_DATE", required = false }
+]
+```
+
+Templates can read them as `{{vars.market}}` or `{{run_vars.market}}`. The TUI collects them before `/run`; non-interactive runs use `--var name=value`.
 
 ## Task States
 
@@ -154,7 +172,7 @@ Validator commands receive:
 - The manifest is updated before each task starts, so interrupted tasks are visible as `running`.
 - Each run has a unique lease id.
 - SQLite records runs, messages, tool events, and artifacts.
-- Scheduler emits progress events for loaded, queued, running, retry, done, and failed tasks.
+- Scheduler emits progress events for Batch Work loading plus queued, running, retry, done, and failed task runs.
 - The Rich dashboard is a subscriber to those events; disabling UI does not change execution semantics.
 - Provider and tool errors are either retried or returned to the model.
 - Task timeout is enforced by the scheduler.

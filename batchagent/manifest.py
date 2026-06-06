@@ -6,7 +6,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from .models import ArtifactPolicy, BatchConfig, Manifest, Task
+from .models import ArtifactPolicy, BatchConfig, Manifest, RunVariable, Task
 from .util import atomic_write_text
 
 
@@ -158,6 +158,7 @@ def _parse_config(text: str) -> BatchConfig:
         thinking=str(raw.get("thinking", "")),
         system_prompt=str(raw.get("system_prompt", "")),
         user_prompt_template=str(raw.get("user_prompt_template", "")),
+        run_variables=_parse_run_variables(raw.get("run_variables", [])),
         memory_files=list(raw.get("memory_files", [])),
         tools=list(raw.get("tools", [])),
         allowed_command_prefixes=[_command_prefix(prefix) for prefix in raw.get("allowed_command_prefixes", [])],
@@ -259,3 +260,31 @@ def _command_prefix(value: Any) -> list[str]:
     if isinstance(value, str):
         return [item for item in value.split(" ") if item]
     raise ManifestError(f"allowed_command_prefixes entries must be list or string: {value!r}")
+
+
+def _parse_run_variables(value: Any) -> list[RunVariable]:
+    variables: list[RunVariable] = []
+    if isinstance(value, dict):
+        iterable = [dict({"name": key}, **(item if isinstance(item, dict) else {"default": item})) for key, item in value.items()]
+    else:
+        iterable = value or []
+    if not isinstance(iterable, list):
+        raise ManifestError("run_variables must be a list or table")
+    for item in iterable:
+        if isinstance(item, str):
+            variables.append(RunVariable(name=item))
+            continue
+        if not isinstance(item, dict):
+            raise ManifestError(f"run_variables entries must be string or table: {item!r}")
+        name = str(item.get("name", "")).strip()
+        if not name:
+            raise ManifestError(f"run_variables entry missing name: {item!r}")
+        variables.append(
+            RunVariable(
+                name=name,
+                label=str(item.get("label") or item.get("prompt") or name),
+                default=str(item.get("default", "")),
+                required=bool(item.get("required", True)),
+            )
+        )
+    return variables

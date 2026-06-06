@@ -25,6 +25,8 @@ def _lookup(path: str, task: Task, config: BatchConfig, current_date: str) -> An
         }
     if path == "config":
         return config.raw
+    if path in {"vars", "run_vars"}:
+        return config.run_vars
     if path == "workspace":
         return config.workspace
     if path.startswith("task."):
@@ -40,6 +42,9 @@ def _lookup(path: str, task: Task, config: BatchConfig, current_date: str) -> An
         parts = path.split(".")[1:]
     elif path.startswith("config."):
         root = config.raw
+        parts = path.split(".")[1:]
+    elif path.startswith("vars.") or path.startswith("run_vars."):
+        root = config.run_vars
         parts = path.split(".")[1:]
     else:
         return ""

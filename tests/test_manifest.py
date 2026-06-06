@@ -35,7 +35,21 @@ class ManifestTests(unittest.TestCase):
             self.assertEqual(reloaded.tasks[0].input["repo"], "D:\\pcia_skill\\repo\\git")
             self.assertEqual(reloaded.tasks[0].input["patch"], "a|b.patch")
 
+    def test_parses_run_variables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "BATCHAGENT.md"
+            create_sample_manifest(path)
+            text = path.read_text(encoding="utf-8")
+            text = text.replace(
+                "tools = [\"write_file\", \"submit_artifact\"]",
+                "tools = [\"write_file\", \"submit_artifact\"]\nrun_variables = [{ name = \"market\", label = \"Market scope\", required = true }]",
+            )
+            path.write_text(text, encoding="utf-8")
+            manifest = load_manifest(path)
+            self.assertEqual(len(manifest.config.run_variables), 1)
+            self.assertEqual(manifest.config.run_variables[0].name, "market")
+            self.assertEqual(manifest.config.run_variables[0].label, "Market scope")
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -51,6 +51,7 @@ class TaskProgress:
 class ProgressState:
     manifest: Manifest
     focus_task_id: str = ""
+    work_id: str = ""
     started_monotonic: float = field(default_factory=time.monotonic)
     total_tasks: int = 0
     eligible_tasks: int = 0
@@ -79,6 +80,7 @@ class ProgressState:
         event_type = event.get("type")
         now = time.monotonic()
         if event_type == "batch_loaded":
+            self.work_id = str(event.get("work_id") or self.work_id)
             self.total_tasks = int(event.get("total_tasks", self.total_tasks))
             self.eligible_tasks = int(event.get("eligible_tasks", self.eligible_tasks))
             self.concurrency = int(event.get("concurrency", self.concurrency))
@@ -199,8 +201,8 @@ class PlainProgress:
         event_type = event.get("type")
         if event_type == "batch_loaded":
             print(
-                f"loaded {event.get('total_tasks', 0)} task(s), "
-                f"eligible {event.get('eligible_tasks', 0)}, concurrency {event.get('concurrency', 1)}"
+                f"batch work {event.get('work_id') or '(unknown)'} loaded {event.get('total_tasks', 0)} task(s), "
+                f"selected {event.get('eligible_tasks', 0)}, concurrency {event.get('concurrency', 1)}"
             )
         elif event_type == "task_started":
             print(f"running {event.get('task_id')} attempt {event.get('attempt')} -> {event.get('run_dir')}")
@@ -263,7 +265,7 @@ class RichRunDisplay:
         header.add_column(ratio=1)
         header.add_row(
             Text(
-                f"loaded {self.state.total_tasks} | eligible {self.state.eligible_tasks} | "
+                f"work {self.state.work_id or '(pending)'} | loaded {self.state.total_tasks} | selected {self.state.eligible_tasks} | "
                 f"running {running} | queued {queued} | done {done} | failed {failed} | retry {retry}"
             )
         )

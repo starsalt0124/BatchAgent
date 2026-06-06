@@ -12,6 +12,12 @@ Existing frameworks cover important parts of the stack, but not the whole batch 
 
 BatchAgent focuses on the missing outer harness: Markdown task manifests, parseable statuses, concurrency control, per-task workspace isolation, artifact submission, validation, retries, and manifest writeback. The internal provider is OpenAI-compatible, so it can be swapped for a framework-backed agent runtime later without changing the manifest contract.
 
+Terminology:
+
+- Batch Config: the Markdown manifest, similar to an executable file.
+- Batch Work: one `/run` invocation of a Batch Config. Each Batch Work gets a `work_id`.
+- Task Run: one task attempt inside a Batch Work. Each Task Run gets a task-level `run_id` and run directory.
+
 ## Install
 
 Python 3.11+ is required. No third-party Python packages are required.
@@ -74,6 +80,10 @@ tools = [
   "web_fetch",
   "submit_artifact"
 ]
+run_variables = [
+  { name = "market", label = "Market scope", required = true },
+  { name = "as_of_date", label = "As-of date", default = "CURR_DATE", required = false }
+]
 
 blocked_path_patterns = [
   ".git",
@@ -129,8 +139,11 @@ Prompt templates support both structured placeholders and a small set of built-i
 
 - `{{task.id}}`, `{{task.kind}}`, `{{task.input.some_key}}`
 - `{{config.some_key}}`
+- `{{vars.some_name}}` or `{{run_vars.some_name}}`, supplied at Batch Work start time
 - `{{workspace}}`
 - `CURR_DATE` or `{{CURR_DATE}}`, replaced at task dispatch time with the current local date in `YYYY-MM-DD` format
+
+When `run_variables` is configured, the TUI asks for those values before starting a Batch Work. Non-interactive runs can pass them with `--var name=value`.
 
 Statuses:
 
@@ -160,8 +173,8 @@ TUI layout:
 Core TUI commands:
 
 ```text
-/show_batch <number|path>
-/run <number|path> [--only task-id] [--retry-failed]
+/show_batch <manifest-path>
+/run [manifest-path] [--only task-id] [--retry-failed]
 /show_task <task-id>
 /history [task-id]
 /retry <task-id|all>
@@ -170,7 +183,7 @@ Core TUI commands:
 /quit
 ```
 
-Type `/` in the TUI command input to show commands with usage examples and descriptions. Use `Up` / `Down` to select a candidate and `Tab` to accept it. Completion covers commands, discovered batch manifests, options, and task ids from the selected manifest.
+Type `/` in the TUI command input to show commands with usage examples and descriptions. Use `Up` / `Down` to select a candidate and `Tab` to accept it. Completion covers commands, discovered manifest paths, options, and task ids from the selected manifest. `/show_batch` and `/run` accept manifest paths, not list numbers or config names; click the left batch table to switch without typing a path.
 
 `/show_task <task-id>` opens an independent task detail window. It shows live model output and tool activity for running tasks; for finished or restarted sessions it reads the latest persisted run messages, tool events, artifacts, and errors from SQLite. Press `Esc` to close the task detail window.
 
@@ -192,15 +205,15 @@ Validate the manifest:
 python -m batchagent doctor BATCHAGENT.md
 ```
 
-Run tasks:
+Start a Batch Work:
 
 ```powershell
 python -m batchagent run BATCHAGENT.md --limit 2
 ```
 
-Every task attempt gets a new `run_id` and a new directory under `.batchagent/runs/<task-id>-<run_id>`. Running an already-run batch updates the manifest's latest task status/result, but it does not overwrite existing run directories, artifacts, or SQLite history.
+Every `/run` creates a Batch Work with a `work_id`. Every task attempt inside that work gets a new `run_id` and a new directory under `.batchagent/runs/<task-id>-<run_id>`. Running an already-run Batch Config updates the manifest's latest task status/result, but it does not overwrite existing run directories, artifacts, or SQLite history.
 
-`run` uses a Rich live dashboard by default when Rich is installed. The dashboard shows loaded, eligible, running, completed, failed, elapsed time, ETA, and the concrete running task ids.
+`run` uses a Rich live dashboard by default when Rich is installed. The dashboard shows the Batch Work id, loaded tasks, selected tasks, running/completed/failed counts, elapsed time, ETA, and the concrete running task ids.
 
 The dashboard uses the terminal alternate screen, so the running UI owns the terminal while active instead of filling scrollback. During execution, each task's `Detail` column shows the model output/tool activity tail; after completion it shows the submitted artifact path or run artifact record.
 
@@ -209,6 +222,7 @@ Useful run options:
 ```powershell
 python -m batchagent run BATCHAGENT.md --focus task-id
 python -m batchagent run BATCHAGENT.md --only task-id --retry-failed
+python -m batchagent run BATCHAGENT.md --var market=A-share
 python -m batchagent run BATCHAGENT.md --plain
 python -m batchagent run BATCHAGENT.md --no-progress
 ```

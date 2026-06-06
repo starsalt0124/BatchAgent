@@ -25,6 +25,7 @@ class SessionStore:
             """
             CREATE TABLE IF NOT EXISTS runs (
                 run_id TEXT PRIMARY KEY,
+                work_id TEXT NOT NULL DEFAULT '',
                 task_id TEXT NOT NULL,
                 attempt INTEGER NOT NULL,
                 status TEXT NOT NULL,
@@ -69,15 +70,21 @@ class SessionStore:
             );
             """
         )
+        self._ensure_column("runs", "work_id", "TEXT NOT NULL DEFAULT ''")
         self.conn.commit()
 
-    def start_run(self, run_id: str, task_id: str, attempt: int, run_dir: Path) -> None:
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        existing = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in existing:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def start_run(self, run_id: str, task_id: str, attempt: int, run_dir: Path, work_id: str = "") -> None:
         self.conn.execute(
             """
-            INSERT OR REPLACE INTO runs(run_id, task_id, attempt, status, run_dir, started_at)
-            VALUES (?, ?, ?, 'running', ?, ?)
+            INSERT OR REPLACE INTO runs(run_id, work_id, task_id, attempt, status, run_dir, started_at)
+            VALUES (?, ?, ?, ?, 'running', ?, ?)
             """,
-            (run_id, task_id, attempt, str(run_dir), utc_now()),
+            (run_id, work_id, task_id, attempt, str(run_dir), utc_now()),
         )
         self.conn.commit()
 
@@ -149,7 +156,7 @@ class SessionStore:
     def task_runs(self, task_id: str) -> list[dict[str, Any]]:
         cursor = self.conn.execute(
             """
-            SELECT run_id, task_id, attempt, status, run_dir, started_at, finished_at, error
+            SELECT run_id, work_id, task_id, attempt, status, run_dir, started_at, finished_at, error
             FROM runs
             WHERE task_id = ?
             ORDER BY started_at DESC, rowid DESC
@@ -159,6 +166,7 @@ class SessionStore:
         return [
             {
                 "run_id": run_id,
+                "work_id": work_id or "",
                 "task_id": task_id,
                 "attempt": attempt,
                 "status": status,
@@ -167,13 +175,13 @@ class SessionStore:
                 "finished_at": finished_at,
                 "error": error or "",
             }
-            for run_id, task_id, attempt, status, run_dir, started_at, finished_at, error in cursor.fetchall()
+            for run_id, work_id, task_id, attempt, status, run_dir, started_at, finished_at, error in cursor.fetchall()
         ]
 
     def all_runs(self, limit: int = 200) -> list[dict[str, Any]]:
         cursor = self.conn.execute(
             """
-            SELECT run_id, task_id, attempt, status, run_dir, started_at, finished_at, error
+            SELECT run_id, work_id, task_id, attempt, status, run_dir, started_at, finished_at, error
             FROM runs
             ORDER BY started_at DESC, rowid DESC
             LIMIT ?
@@ -183,6 +191,7 @@ class SessionStore:
         return [
             {
                 "run_id": run_id,
+                "work_id": work_id or "",
                 "task_id": task_id,
                 "attempt": attempt,
                 "status": status,
@@ -191,7 +200,7 @@ class SessionStore:
                 "finished_at": finished_at,
                 "error": error or "",
             }
-            for run_id, task_id, attempt, status, run_dir, started_at, finished_at, error in cursor.fetchall()
+            for run_id, work_id, task_id, attempt, status, run_dir, started_at, finished_at, error in cursor.fetchall()
         ]
 
     def run_messages(self, run_id: str, limit: int = 20) -> list[dict[str, Any]]:

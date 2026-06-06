@@ -45,14 +45,15 @@ def main(argv: list[str] | None = None) -> int:
     status_parser = subparsers.add_parser("status", help="Print task status counts.")
     status_parser.add_argument("manifest")
 
-    run_parser = subparsers.add_parser("run", help="Run eligible tasks from a manifest.")
+    run_parser = subparsers.add_parser("run", help="Start a batch work from a manifest.")
     run_parser.add_argument("manifest")
-    run_parser.add_argument("--limit", type=int, default=None, help="Maximum tasks to run.")
-    run_parser.add_argument("--retry-failed", action="store_true", help="Treat failed tasks as eligible.")
-    run_parser.add_argument("--only", action="append", default=None, help="Run only this task id. Can be repeated.")
+    run_parser.add_argument("--limit", type=int, default=None, help="Maximum task rows to select for this Batch Work.")
+    run_parser.add_argument("--retry-failed", action="store_true", help="Include failed tasks in this Batch Work selection.")
+    run_parser.add_argument("--only", action="append", default=None, help="Select only this task id for the Batch Work. Can be repeated.")
     run_parser.add_argument("--plain", action="store_true", help="Disable Rich live dashboard and print plain progress events.")
     run_parser.add_argument("--no-progress", action="store_true", help="Disable progress output during execution.")
     run_parser.add_argument("--focus", default="", help="Highlight one task in the live dashboard.")
+    run_parser.add_argument("--var", action="append", default=None, help="Runtime template variable as name=value. Can be repeated.")
 
     recover_parser = subparsers.add_parser("recover", help="Move stale running tasks to retry or failed.")
     recover_parser.add_argument("manifest")
@@ -138,9 +139,10 @@ async def _run_with_progress(args) -> list:
     manifest = load_manifest(args.manifest)
     validate_manifest(manifest)
     task_ids = set(args.only) if args.only else None
+    run_vars = _parse_run_vars(args.var or [])
     if args.no_progress:
         args._used_rich_progress = False
-        return await run_manifest(args.manifest, limit=args.limit, retry_failed=args.retry_failed, task_ids=task_ids)
+        return await run_manifest(args.manifest, limit=args.limit, retry_failed=args.retry_failed, task_ids=task_ids, run_vars=run_vars)
 
     state = ProgressState.from_manifest(manifest, focus_task_id=args.focus)
     if args.plain:
@@ -151,6 +153,7 @@ async def _run_with_progress(args) -> list:
             limit=args.limit,
             retry_failed=args.retry_failed,
             task_ids=task_ids,
+            run_vars=run_vars,
             progress_callback=plain.callback,
         )
 
@@ -163,6 +166,7 @@ async def _run_with_progress(args) -> list:
             limit=args.limit,
             retry_failed=args.retry_failed,
             task_ids=task_ids,
+            run_vars=run_vars,
             progress_callback=plain.callback,
         )
     args._used_rich_progress = True
@@ -172,27 +176,42 @@ async def _run_with_progress(args) -> list:
             limit=args.limit,
             retry_failed=args.retry_failed,
             task_ids=task_ids,
+            run_vars=run_vars,
             progress_callback=state.handle_event,
         )
     )
 
 
+def _parse_run_vars(values: list[str]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise RuntimeError(f"--var must be name=value: {value}")
+        name, item = value.split("=", 1)
+        name = name.strip()
+        if not name:
+            raise RuntimeError(f"--var name is empty: {value}")
+        parsed[name] = item
+    return parsed
+
+
 def _print_rich_completion(manifest_path: str, results) -> None:
     failed = [result for result in results if not result.success]
+    work_id = next((result.work_id for result in results if getattr(result, "work_id", "")), "")
     if failed:
-        print(f"Batch finished with {len(failed)} failed task(s).")
+        print(f"Batch work {work_id or '(unknown)'} finished with {len(failed)} failed task(s).")
         print("Recovery options:")
         print(f"  Inspect: python -m batchagent inspect {manifest_path} {failed[0].task_id}")
         print(f"  Retry:   python -m batchagent retry {manifest_path} " + " ".join(result.task_id for result in failed))
         print(f"  Run:     python -m batchagent run {manifest_path} --retry-failed")
         return
-    print(f"Batch completed: {len(results)} task(s) done.")
+    print(f"Batch work {work_id or '(unknown)'} completed: {len(results)} task(s) done.")
 
 
 def _print_run_results(manifest_path: str, results) -> None:
     for result in results:
         state = "done" if result.success else "failed"
-        print(f"{state}\t{result.task_id}\t{result.run_dir}")
+        print(f"{state}\t{result.work_id}\t{result.task_id}\t{result.run_dir}")
         if result.error:
             print(f"  error: {result.error}")
     failed = [result for result in results if not result.success]
@@ -309,6 +328,7 @@ def _render_inspect(task, runs, run_id: str, store: SessionStore, messages_limit
     )
 
     table = Table(title="Runs")
+    table.add_column("Work ID")
     table.add_column("Run ID")
     table.add_column("Attempt", justify="right")
     table.add_column("Status")
@@ -317,6 +337,7 @@ def _render_inspect(task, runs, run_id: str, store: SessionStore, messages_limit
     table.add_column("Error")
     for run in runs:
         table.add_row(
+            run.get("work_id", ""),
             run["run_id"],
             str(run["attempt"]),
             run["status"],

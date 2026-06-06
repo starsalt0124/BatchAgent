@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,10 +28,14 @@ async def run_manifest(
     limit: int | None = None,
     retry_failed: bool = False,
     task_ids: set[str] | None = None,
+    work_id: str | None = None,
+    run_vars: dict[str, Any] | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> list[AgentRunResult]:
     manifest = load_manifest(manifest_path)
     validate_manifest(manifest)
+    work_id = work_id or new_work_id()
+    manifest.config.run_vars = _resolve_run_vars(manifest, run_vars or {})
     state_db = _state_db_path(manifest)
     store = SessionStore(state_db)
     semaphore = asyncio.Semaphore(manifest.config.effective_concurrency)
@@ -48,6 +53,7 @@ async def run_manifest(
         progress_callback,
         {
             "type": "batch_loaded",
+            "work_id": work_id,
             "total_tasks": len(manifest.tasks),
             "eligible_tasks": len(eligible),
             "concurrency": manifest.config.effective_concurrency,
@@ -55,11 +61,11 @@ async def run_manifest(
         },
     )
     for task in eligible:
-        _emit(progress_callback, {"type": "task_queued", "task_id": task.id, "attempts": task.attempts})
+        _emit(progress_callback, {"type": "task_queued", "work_id": work_id, "task_id": task.id, "attempts": task.attempts})
 
     async def worker(task: Task) -> AgentRunResult:
         async with semaphore:
-            return await _run_one_with_retries(manifest, task, store, write_lock, progress_callback)
+            return await _run_one_with_retries(manifest, task, store, write_lock, work_id, progress_callback)
 
     try:
         return await asyncio.gather(*(worker(task) for task in eligible))
@@ -149,6 +155,7 @@ async def _run_one_with_retries(
     task: Task,
     store: SessionStore,
     write_lock: asyncio.Lock,
+    work_id: str,
     progress_callback: ProgressCallback | None = None,
 ) -> AgentRunResult:
     attempt_deadline = task.attempts + max(1, manifest.config.retries + 1)
@@ -162,6 +169,7 @@ async def _run_one_with_retries(
             progress_callback,
             {
                 "type": "task_started",
+                "work_id": work_id,
                 "task_id": task.id,
                 "run_id": run_id,
                 "attempt": task.attempts,
@@ -172,7 +180,7 @@ async def _run_one_with_retries(
         )
         try:
             result = await asyncio.wait_for(
-                run_agent_task(manifest.path, manifest.config, task, store, run_id=run_id, progress_callback=progress_callback),
+                run_agent_task(manifest.path, manifest.config, task, store, run_id=run_id, work_id=work_id, progress_callback=progress_callback),
                 timeout=manifest.config.timeout_seconds,
             )
         except asyncio.TimeoutError:
@@ -184,6 +192,7 @@ async def _run_one_with_retries(
                 success=False,
                 task_id=task.id,
                 run_dir=run_dir,
+                work_id=work_id,
                 error=f"task timed out after {manifest.config.timeout_seconds} seconds",
             )
         last_result = result
@@ -195,6 +204,7 @@ async def _run_one_with_retries(
                 progress_callback,
                 {
                     "type": "task_done",
+                    "work_id": work_id,
                     "task_id": task.id,
                     "attempt": task.attempts,
                     "status": task.status,
@@ -211,6 +221,7 @@ async def _run_one_with_retries(
                 progress_callback,
                 {
                     "type": "task_retry",
+                    "work_id": work_id,
                     "task_id": task.id,
                     "attempt": task.attempts,
                     "status": task.status,
@@ -225,6 +236,7 @@ async def _run_one_with_retries(
             progress_callback,
             {
                 "type": "task_failed",
+                "work_id": work_id,
                 "task_id": task.id,
                 "attempt": task.attempts,
                 "status": task.status,
@@ -270,6 +282,27 @@ def _state_db_path(manifest: Manifest) -> Path:
 
 def state_db_path(manifest: Manifest) -> Path:
     return _state_db_path(manifest)
+
+
+def new_work_id() -> str:
+    return f"work-{uuid.uuid4().hex[:12]}"
+
+
+def _resolve_run_vars(manifest: Manifest, provided: dict[str, Any]) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    missing: list[str] = []
+    for variable in manifest.config.run_variables:
+        value = provided.get(variable.name, variable.default)
+        if isinstance(value, str):
+            value = value.replace("CURR_DATE", date.today().isoformat())
+        if variable.required and str(value).strip() == "":
+            missing.append(variable.name)
+        values[variable.name] = value
+    for key, value in provided.items():
+        values.setdefault(key, value)
+    if missing:
+        raise SchedulerError(f"missing required run variable(s): {', '.join(missing)}")
+    return values
 
 
 def _emit(callback: ProgressCallback | None, event: dict[str, Any]) -> None:

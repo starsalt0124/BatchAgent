@@ -19,6 +19,14 @@ class ArtifactPolicy:
 
 
 @dataclass
+class RunVariable:
+    name: str
+    label: str = ""
+    default: str = ""
+    required: bool = True
+
+
+@dataclass
 class BatchConfig:
     version: int = 1
     name: str = "batchagent"
@@ -43,6 +51,8 @@ class BatchConfig:
     thinking: str = ""
     system_prompt: str = ""
     user_prompt_template: str = ""
+    run_variables: list[RunVariable] = field(default_factory=list)
+    run_vars: dict[str, Any] = field(default_factory=dict)
     memory_files: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
     allowed_command_prefixes: list[list[str]] = field(default_factory=list)
@@ -132,6 +142,7 @@ class AgentRunResult:
     success: bool
     task_id: str
     run_dir: Path
+    work_id: str = ""
     artifact_record_path: Path | None = None
     artifact: ArtifactSubmission | None = None
     error: str = ""

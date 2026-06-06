@@ -19,6 +19,12 @@ class TemplateTests(unittest.TestCase):
         result = render_template("today=CURR_DATE templated={{CURR_DATE}}", task, config, current_date="2026-06-05")
         self.assertEqual(result, "today=2026-06-05 templated=2026-06-05")
 
+    def test_renders_runtime_variables(self) -> None:
+        task = Task(status="todo", id="abc")
+        config = BatchConfig(run_vars={"market": "A股", "date": "2026-06-06"})
+        result = render_template("market={{vars.market}} date={{run_vars.date}}", task, config)
+        self.assertEqual(result, "market=A股 date=2026-06-06")
+
 
 if __name__ == "__main__":
     unittest.main()

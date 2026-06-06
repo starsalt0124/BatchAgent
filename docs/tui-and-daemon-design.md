@@ -10,15 +10,18 @@ The current implementation is a single-process runner with a full-screen Textual
 - The bottom command input accepts `/show_batch`, `/run`, `/show_task`, `/history`, `/retry`, `/rerun`, `/refresh`, and `/quit`.
 - Typing `/` opens command candidates with usage examples and descriptions.
 - `Up` / `Down` selects a command candidate and `Tab` accepts it.
-- Completion covers the current command, discovered manifest, option, or task id from the selected manifest.
+- Completion covers the current command, discovered manifest path, option, or task id from the selected manifest. `/show_batch` and `/run` accept manifest paths only.
 - The left sidebar is batch context only: discovered manifests and the current selected batch.
+- Clicking a batch row selects that Batch Config. Clicking a task row opens the same task detail modal as `/show_task <task-id>`.
 - The top panel repeats the selected batch so every page has explicit batch context.
 - `/show_task <task-id>` opens an independent task detail modal. It shows live progress when available and falls back to persisted SQLite messages, tool events, artifacts, and errors for prior runs.
+- `Ctrl+C` is left for terminal/input copy behavior; exiting the TUI is `Ctrl+Q`, `/quit`, or `/exit`.
+- If a Batch Config declares `run_variables`, `/run` opens a runtime-variable modal before creating the Batch Work.
 - The scheduler emits structured progress events.
 - The TUI consumes those events and renders manifest, batch, run, and task pages.
 - While a task is running, the detail field shows model deltas and tool activity.
 - When a task completes, the detail field switches to the artifact path or artifact record.
-- Each task attempt creates a unique `.batchagent/runs/<task>-<run_id>` directory. Re-running a batch updates the latest manifest row but keeps previous run directories, artifacts, and SQLite history.
+- A Batch Config is the manifest file. A Batch Work is one `/run` invocation and has a `work_id`. Each task attempt inside the work has a unique `run_id` and `.batchagent/runs/<task>-<run_id>` directory. Re-running a Batch Config creates a new Batch Work and keeps previous run directories, artifacts, and SQLite history.
 - `--plain` and `--no-progress` remain available for logs and automation.
 
 This keeps execution deterministic: disabling the TUI does not change scheduling, tool calls, retries, or manifest writeback.

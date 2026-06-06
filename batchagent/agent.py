@@ -26,13 +26,14 @@ async def run_agent_task(
     task: Task,
     store: SessionStore,
     run_id: str | None = None,
+    work_id: str = "",
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> AgentRunResult:
     run_id = run_id or uuid.uuid4().hex[:12]
     run_dir = task_run_dir(config, manifest_path, task, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     workspace = prepare_workspace(config, manifest_path, task, run_dir)
-    store.start_run(run_id, task.id, task.attempts, run_dir)
+    store.start_run(run_id, task.id, task.attempts, run_dir, work_id=work_id)
 
     messages = _initial_messages(config, task, store, workspace)
     ctx = ToolContext(config=config, task=task, workspace=workspace, run_dir=run_dir)
@@ -43,13 +44,13 @@ async def run_agent_task(
     try:
         if config.artifact.require_submit and "submit_artifact" not in config.tools:
             raise AgentExecutionError("artifact.require_submit is true but submit_artifact is not loaded in tools")
-        write_json(run_dir / "task.json", {"task": task.__dict__, "workspace": str(workspace)})
+        write_json(run_dir / "task.json", {"task": task.__dict__, "workspace": str(workspace), "work_id": work_id, "run_vars": config.run_vars})
         for message in messages:
             seq += 1
             store.add_message(run_id, seq, message["role"], str(message.get("content") or ""), message)
 
         for _turn in range(config.max_turns):
-            assistant = await asyncio.to_thread(provider.chat, messages, specs, _delta_callback(progress_callback, task.id, run_id))
+            assistant = await asyncio.to_thread(provider.chat, messages, specs, _delta_callback(progress_callback, task.id, run_id, work_id))
             seq += 1
             store.add_message(run_id, seq, "assistant", assistant.content, assistant.raw)
             _emit(
@@ -58,6 +59,7 @@ async def run_agent_task(
                     "type": "assistant_message",
                     "task_id": task.id,
                     "run_id": run_id,
+                    "work_id": work_id,
                     "content": assistant.content or "",
                     "timestamp": "",
                 },
@@ -72,6 +74,7 @@ async def run_agent_task(
                             "type": "tool_started",
                             "task_id": task.id,
                             "run_id": run_id,
+                            "work_id": work_id,
                             "tool": tool_call.name,
                             "arguments": tool_call.arguments,
                         },
@@ -83,6 +86,7 @@ async def run_agent_task(
                             "type": "tool_finished",
                             "task_id": task.id,
                             "run_id": run_id,
+                            "work_id": work_id,
                             "tool": tool_call.name,
                             "arguments": tool_call.arguments,
                             "error": error,
@@ -107,6 +111,7 @@ async def run_agent_task(
                             "type": "artifact_submitted",
                             "task_id": task.id,
                             "run_id": run_id,
+                            "work_id": work_id,
                             "summary": ctx.submission.summary,
                             "artifact_path": ctx.submission.artifact_path,
                             "metadata": ctx.submission.metadata,
@@ -125,6 +130,7 @@ async def run_agent_task(
                         success=True,
                         task_id=task.id,
                         run_dir=run_dir,
+                        work_id=work_id,
                         artifact_record_path=run_dir / "artifact.json",
                         artifact=ctx.submission,
                     )
@@ -133,13 +139,13 @@ async def run_agent_task(
             if config.artifact.require_submit:
                 raise AgentExecutionError("model returned final text without submit_artifact")
             store.finish_run(run_id, "done")
-            return AgentRunResult(success=True, task_id=task.id, run_dir=run_dir)
+            return AgentRunResult(success=True, task_id=task.id, run_dir=run_dir, work_id=work_id)
 
         raise AgentExecutionError(f"max_turns exceeded: {config.max_turns}")
     except (AgentExecutionError, ArtifactValidationError, ToolError, Exception) as exc:
         error = str(exc)
         store.finish_run(run_id, "failed", error)
-        return AgentRunResult(success=False, task_id=task.id, run_dir=run_dir, error=error)
+        return AgentRunResult(success=False, task_id=task.id, run_dir=run_dir, work_id=work_id, error=error)
 
 
 def _initial_messages(config: BatchConfig, task: Task, store: SessionStore, workspace: Path) -> list[dict[str, Any]]:
@@ -217,12 +223,13 @@ def _delta_callback(
     progress_callback: Callable[[dict[str, Any]], None] | None,
     task_id: str,
     run_id: str,
+    work_id: str,
 ) -> Callable[[str], None] | None:
     if progress_callback is None:
         return None
 
     def callback(delta: str) -> None:
-        _emit(progress_callback, {"type": "model_delta", "task_id": task_id, "run_id": run_id, "delta": delta})
+        _emit(progress_callback, {"type": "model_delta", "task_id": task_id, "run_id": run_id, "work_id": work_id, "delta": delta})
 
     return callback
 

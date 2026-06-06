@@ -4,6 +4,7 @@ import asyncio
 import json
 import shlex
 import threading
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -15,16 +16,16 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
 from .manifest import ManifestError, load_manifest
-from .models import Manifest, Task
+from .models import Manifest, RunVariable, Task
 from .progress import ProgressState, _format_seconds
-from .scheduler import mark_tasks_for_retry, rerun_tasks, run_manifest, state_db_path, status, validate_manifest
+from .scheduler import mark_tasks_for_retry, new_work_id, rerun_tasks, run_manifest, state_db_path, status, validate_manifest
 from .store import SessionStore
 from .util import console_safe, truncate
 
 
 COMMAND_SPECS = [
-    ("/show_batch", "/show_batch <number|path|name>", "Select and inspect a batch manifest."),
-    ("/run", "/run [number|path|name] [--only task-id] [--retry-failed]", "Run eligible tasks; every attempt gets a new run directory."),
+    ("/show_batch", "/show_batch <manifest-path>", "Select and inspect a batch configuration file."),
+    ("/run", "/run [manifest-path] [--only task-id] [--retry-failed]", "Start a batch work from the selected batch configuration."),
     ("/show_task", "/show_task <task-id>", "Show the selected task row and live task detail."),
     ("/history", "/history [task-id|all]", "Show persisted run history for the current batch."),
     ("/retry", "/retry <task-id|all>", "Mark failed task(s) as retry without deleting prior history."),
@@ -84,12 +85,12 @@ class TaskDetailScreen(ModalScreen[None]):
 
     BINDINGS = [
         ("escape", "close", "Close"),
-        ("ctrl+c", "close", "Close"),
     ]
 
     def __init__(self, task_id: str):
         super().__init__()
         self.task_id = task_id
+        self._last_content = ""
 
     def compose(self) -> ComposeResult:
         with Vertical(id="task_modal"):
@@ -104,12 +105,112 @@ class TaskDetailScreen(ModalScreen[None]):
         title = self.query_one("#task_modal_title", Static)
         body = self.query_one("#task_modal_body", RichLog)
         title.update(f"Task Detail: {self.task_id}\nEsc closes this window.")
-        body.clear()
         detail_text = getattr(self.app, "task_detail_text_for")(self.task_id)
-        body.write(Panel(detail_text, title=self.task_id))
+        if detail_text == self._last_content:
+            return
+        self._last_content = detail_text
+        scroll_y = body.scroll_y
+        was_at_end = body.is_vertical_scroll_end
+        body.clear()
+        body.write(Panel(detail_text, title=self.task_id), scroll_end=was_at_end)
+        if not was_at_end:
+            body.scroll_to(y=scroll_y, animate=False, force=True)
 
     def action_close(self) -> None:
         self.dismiss()
+
+
+class RunVariablesScreen(ModalScreen[dict[str, str] | None]):
+    CSS = """
+    RunVariablesScreen {
+        align: center middle;
+    }
+
+    #vars_modal {
+        width: 78%;
+        height: 54%;
+        border: thick $primary;
+        background: $surface;
+    }
+
+    #vars_title {
+        height: 5;
+        border-bottom: solid $surface;
+        padding: 0 1;
+    }
+
+    #vars_help {
+        height: 1fr;
+        padding: 0 1;
+    }
+
+    #vars_input {
+        height: 3;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, variables: list[RunVariable], initial: dict[str, Any] | None = None):
+        super().__init__()
+        self.variables = variables
+        self.values = {key: str(value) for key, value in (initial or {}).items()}
+        self.index = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="vars_modal"):
+            yield Static("", id="vars_title")
+            yield RichLog(id="vars_help", wrap=True, highlight=False)
+            yield Input(id="vars_input")
+
+    def on_mount(self) -> None:
+        self.render_variable()
+        self.query_one("#vars_input", Input).focus()
+
+    def render_variable(self) -> None:
+        variable = self.variables[self.index]
+        title = self.query_one("#vars_title", Static)
+        detail = self.query_one("#vars_help", RichLog)
+        input_widget = self.query_one("#vars_input", Input)
+        default_value = self.resolve_variable_default(self.values.get(variable.name, variable.default))
+        title.update(
+            "\n".join(
+                [
+                    "Runtime Variables",
+                    f"{self.index + 1}/{len(self.variables)} {variable.name}",
+                    "Enter saves this value. Esc cancels this batch work.",
+                ]
+            )
+        )
+        detail.clear()
+        detail.write(variable.label or variable.name)
+        detail.write(f"required: {variable.required}")
+        if variable.default:
+            detail.write(f"default: {variable.default}")
+        input_widget.placeholder = variable.name
+        input_widget.value = default_value
+        input_widget.cursor_position = len(input_widget.value)
+
+    def resolve_variable_default(self, value: str) -> str:
+        return str(value).replace("CURR_DATE", date.today().isoformat())
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        variable = self.variables[self.index]
+        value = event.value
+        if variable.required and not value.strip():
+            self.notify(f"{variable.name} is required", severity="error")
+            return
+        self.values[variable.name] = value
+        self.index += 1
+        if self.index >= len(self.variables):
+            self.dismiss(self.values)
+            return
+        self.render_variable()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class BatchAgentTui(App[None]):
@@ -172,7 +273,7 @@ class BatchAgentTui(App[None]):
     """
 
     BINDINGS = [
-        ("ctrl+c", "quit", "Quit"),
+        ("ctrl+c", "copy", "Copy"),
         ("ctrl+q", "quit", "Quit"),
         ("f1", "help", "Help"),
         ("escape", "show_batch", "Batch"),
@@ -189,6 +290,7 @@ class BatchAgentTui(App[None]):
         self.progress_state: ProgressState | None = None
         self.run_task: asyncio.Task | None = None
         self.run_results: list[Any] = []
+        self.current_work_id = ""
         self.ui_thread = 0
         self.history_task_id = ""
         self._completion_value = ""
@@ -214,6 +316,8 @@ class BatchAgentTui(App[None]):
     async def on_mount(self) -> None:
         self.ui_thread = threading.get_ident()
         self.query_one("#command", Input).focus()
+        self.query_one("#manifest_table", DataTable).cursor_type = "row"
+        self.query_one("#table", DataTable).cursor_type = "row"
         self.discover_manifests()
         if self.start_manifest:
             self.load_manifest(Path(self.start_manifest))
@@ -239,6 +343,14 @@ class BatchAgentTui(App[None]):
         elif self.page == "history":
             self.render_history()
 
+    def action_copy(self) -> None:
+        focused = self.focused
+        copy_action = getattr(focused, "action_copy", None)
+        if copy_action is not None:
+            copy_action()
+            return
+        self.notify("No focused text input to copy from.", severity="warning")
+
     def render_sidebar(self) -> None:
         self.query_one("#side_title", Static).update("Batches\nDiscovered manifests")
         self.query_one("#selection", Static).update(self.selection_text())
@@ -254,7 +366,7 @@ class BatchAgentTui(App[None]):
             except Exception:
                 state = "invalid"
             selected = "*" if self.selected_manifest_path and path.resolve() == self.selected_manifest_path.resolve() else ""
-            table.add_row(selected, str(index), label, state, key=str(index))
+            table.add_row(selected, str(index), label, state, key=f"manifest:{self.display_manifest_path(path)}")
 
     def selection_text(self) -> str:
         if self.selected_manifest is None:
@@ -297,14 +409,14 @@ class BatchAgentTui(App[None]):
         )
         table = self.query_one("#table", DataTable)
         table.clear(columns=True)
-        table.add_columns("#", "Path", "Summary")
+        table.add_columns("Path", "Summary")
         for index, path in enumerate(self.manifest_paths, start=1):
             try:
                 counts = status(path)
                 summary = ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
             except Exception as exc:
                 summary = f"invalid: {exc}"
-            table.add_row(str(index), str(path), summary, key=str(index))
+            table.add_row(self.display_manifest_path(path), summary, key=f"manifest:{self.display_manifest_path(path)}")
         self.set_detail(
             [
                 "Screen areas:",
@@ -347,7 +459,7 @@ class BatchAgentTui(App[None]):
                 task.kind,
                 str(task.attempts),
                 truncate(task.error or task.result or json.dumps(task.input, ensure_ascii=False), 140),
-                key=task.id,
+                key=f"task:{task.id}",
             )
         self.set_detail(
             [
@@ -373,8 +485,9 @@ class BatchAgentTui(App[None]):
                 "\n".join(
                     [
                         self.selected_batch_line(),
-                        f"Run: {state.manifest.path}",
-                        f"loaded={state.total_tasks} eligible={state.eligible_tasks} running={running} queued={queued} done={done} failed={failed}",
+                        f"Batch Work: {state.work_id or self.current_work_id or '(pending)'}",
+                        f"Config: {state.manifest.path}",
+                        f"loaded={state.total_tasks} selected={state.eligible_tasks} running={running} queued={queued} done={done} failed={failed}",
                         f"elapsed={_format_seconds(state.elapsed())} eta={'unknown' if eta is None else _format_seconds(eta)}",
                         "run dirs are unique per attempt; existing task results are not overwritten on disk",
                     ]
@@ -394,7 +507,7 @@ class BatchAgentTui(App[None]):
                 str(task.attempts),
                 _format_seconds(task.elapsed_current(now)),
                 truncate(detail, 160),
-                key=task.id,
+                key=f"task:{task.id}",
             )
         self.render_focused_task_detail()
 
@@ -410,9 +523,10 @@ class BatchAgentTui(App[None]):
         self.query_one("#title", Static).update(Panel("\n".join(title_lines), title="Run History"))
         table = self.query_one("#table", DataTable)
         table.clear(columns=True)
-        table.add_columns("Task", "Run ID", "Attempt", "Status", "Started", "Finished", "Run Dir", "Error")
+        table.add_columns("Work ID", "Task", "Run ID", "Attempt", "Status", "Started", "Finished", "Run Dir", "Error")
         for row in rows:
             table.add_row(
+                row.get("work_id", ""),
                 row["task_id"],
                 row["run_id"],
                 str(row["attempt"]),
@@ -421,7 +535,7 @@ class BatchAgentTui(App[None]):
                 row["finished_at"] or "",
                 truncate(row["run_dir"], 80),
                 truncate(row["error"], 80),
-                key=row["run_id"],
+                key=f"task:{row['task_id']}",
             )
         self.set_detail(
             [
@@ -453,6 +567,26 @@ class BatchAgentTui(App[None]):
         detail.clear()
         for line in lines:
             detail.write(line)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        key = self.row_key_value(event)
+        if key.startswith("manifest:"):
+            try:
+                self.load_manifest_by_token(key.removeprefix("manifest:"))
+                self.page = "batch"
+                self.render_page()
+            except Exception as exc:
+                self.notify(str(exc), severity="error")
+            return
+        if key.startswith("task:"):
+            try:
+                self.open_task_detail(key.removeprefix("task:"))
+            except Exception as exc:
+                self.notify(str(exc), severity="error")
+
+    def row_key_value(self, event: DataTable.RowSelected) -> str:
+        row_key = event.row_key
+        return str(getattr(row_key, "value", row_key))
 
     def history_rows(self, task_id: str | None = None) -> list[dict[str, Any]]:
         manifest = self.require_manifest()
@@ -549,7 +683,7 @@ class BatchAgentTui(App[None]):
         if candidate == "--only":
             return "--only <task-id> - Run exactly one task from the selected/current batch."
         if candidate == "--retry-failed":
-            return "--retry-failed - Treat failed tasks as eligible for this run."
+            return "--retry-failed - Include failed tasks in this Batch Work selection."
         if candidate == "all":
             return "all - Apply to all relevant tasks or show all run history."
         task = self.task_for_token(candidate)
@@ -580,14 +714,31 @@ class BatchAgentTui(App[None]):
         tokens = before.strip().split()
         if tokens and tokens[-1] == "--only":
             return self.filter_candidates(self.task_completion_tokens(), token)
-        option_candidates = ["--only", "--retry-failed"]
-        consumed_manifest = any(not item.startswith("-") for item in tokens[1:] if item != "--only")
+        if tokens and tokens[-1] == "--var":
+            return []
+        option_candidates = ["--only", "--retry-failed", "--var"]
+        consumed_manifest = self.run_command_has_manifest(tokens)
         if token.startswith("-"):
             return self.filter_candidates(option_candidates, token)
         candidates = option_candidates if consumed_manifest or self.selected_manifest else []
         if not consumed_manifest:
             candidates = [*self.manifest_completion_tokens(), *candidates]
         return self.filter_candidates(candidates, token)
+
+    def run_command_has_manifest(self, tokens: list[str]) -> bool:
+        index = 1
+        while index < len(tokens):
+            item = tokens[index]
+            if item in {"--only", "--var"}:
+                index += 2
+                continue
+            if item == "--retry-failed" or item.startswith("--var="):
+                index += 1
+                continue
+            if not item.startswith("-"):
+                return True
+            index += 1
+        return False
 
     def command_name_for_completion(self, before: str, token: str) -> str | None:
         tokens = before.strip().split()
@@ -633,31 +784,16 @@ class BatchAgentTui(App[None]):
         return matches
 
     def manifest_completion_tokens(self) -> list[str]:
-        tokens: list[str] = []
-        for index, path in enumerate(self.manifest_paths, start=1):
-            tokens.append(str(index))
-            tokens.append(self.display_manifest_path(path))
-            tokens.append(path.parent.name)
-            try:
-                tokens.append(load_manifest(path).config.name)
-            except Exception:
-                pass
-        return [token for token in tokens if token]
+        return [self.display_manifest_path(path) for path in self.manifest_paths]
 
     def manifest_for_token(self, token: str) -> Manifest | None:
         matches: list[Manifest] = []
-        for index, path in enumerate(self.manifest_paths, start=1):
+        for path in self.manifest_paths:
             try:
                 manifest = load_manifest(path)
             except Exception:
                 continue
-            aliases = {
-                str(index),
-                self.display_manifest_path(path),
-                path.parent.name,
-                str(path),
-                manifest.config.name,
-            }
+            aliases = {self.display_manifest_path(path), str(path)}
             if token in aliases:
                 matches.append(manifest)
         return matches[0] if len(matches) == 1 else None
@@ -688,15 +824,10 @@ class BatchAgentTui(App[None]):
 
     async def handle_command(self, command: str) -> None:
         if not command.startswith("/"):
-            if command.isdigit():
-                self.load_manifest_by_token(command)
-                self.page = "batch"
-                self.render_page()
-                return
             self.notify("Commands start with /. Use /help.", severity="warning")
             return
         try:
-            parts = shlex.split(command)
+            parts = self.split_command(command)
         except ValueError as exc:
             self.notify(str(exc), severity="error")
             return
@@ -730,7 +861,15 @@ class BatchAgentTui(App[None]):
         except Exception as exc:
             self.notify(str(exc), severity="error")
 
+    def split_command(self, command: str) -> list[str]:
+        lexer = shlex.shlex(command, posix=True)
+        lexer.whitespace_split = True
+        lexer.escape = ""
+        return list(lexer)
+
     def command_show_batch(self, args: list[str]) -> None:
+        if len(args) > 1:
+            raise RuntimeError("Usage: /show_batch <manifest-path>")
         token = args[0] if args else None
         if token:
             self.load_manifest_by_token(token)
@@ -740,7 +879,7 @@ class BatchAgentTui(App[None]):
         self.render_page()
 
     def command_show_task(self, args: list[str]) -> None:
-        if not args:
+        if len(args) != 1:
             raise RuntimeError("Usage: /show_task <task-id>")
         self.focus_task_id = args[0]
         self.open_task_detail(args[0])
@@ -765,13 +904,20 @@ class BatchAgentTui(App[None]):
     async def command_run(self, args: list[str]) -> None:
         if self.run_task and not self.run_task.done():
             raise RuntimeError("A batch is already running in this TUI.")
-        token, only, retry_failed = self.parse_run_args(args)
+        token, only, retry_failed, inline_vars = self.parse_run_args(args)
         if token:
             self.load_manifest_by_token(token)
         manifest = self.require_manifest()
         validate_manifest(manifest)
+        run_vars = await self.collect_run_vars(manifest, inline_vars)
+        if run_vars is None:
+            self.notify("batch work canceled", severity="warning")
+            return
+        work_id = new_work_id()
         state = ProgressState.from_manifest(manifest, focus_task_id=only or self.focus_task_id)
+        state.work_id = work_id
         self.progress_state = state
+        self.current_work_id = work_id
         self.focus_task_id = state.focus_task_id
         self.history_task_id = ""
         self.page = "run"
@@ -782,6 +928,8 @@ class BatchAgentTui(App[None]):
                 manifest.path,
                 retry_failed=retry_failed,
                 task_ids=task_ids,
+                work_id=work_id,
+                run_vars=run_vars,
                 progress_callback=self.progress_callback,
             )
         )
@@ -808,10 +956,24 @@ class BatchAgentTui(App[None]):
         self.page = "batch"
         self.render_page()
 
-    def parse_run_args(self, args: list[str]) -> tuple[str | None, str | None, bool]:
+    async def collect_run_vars(self, manifest: Manifest, initial: dict[str, str]) -> dict[str, str] | None:
+        if not manifest.config.run_variables:
+            return initial
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, str] | None] = loop.create_future()
+
+        def callback(result: dict[str, str] | None) -> None:
+            if not future.done():
+                future.set_result(result)
+
+        self.push_screen(RunVariablesScreen(manifest.config.run_variables, initial), callback=callback)
+        return await future
+
+    def parse_run_args(self, args: list[str]) -> tuple[str | None, str | None, bool, dict[str, str]]:
         token: str | None = None
         only: str | None = None
         retry_failed = False
+        run_vars: dict[str, str] = {}
         index = 0
         while index < len(args):
             arg = args[index]
@@ -822,12 +984,30 @@ class BatchAgentTui(App[None]):
                 only = args[index]
             elif arg == "--retry-failed":
                 retry_failed = True
+            elif arg == "--var":
+                index += 1
+                if index >= len(args):
+                    raise RuntimeError("--var requires name=value")
+                name, value = self.parse_var_arg(args[index])
+                run_vars[name] = value
+            elif arg.startswith("--var="):
+                name, value = self.parse_var_arg(arg.removeprefix("--var="))
+                run_vars[name] = value
             elif token is None:
                 token = arg
             else:
                 raise RuntimeError(f"unexpected argument: {arg}")
             index += 1
-        return token, only, retry_failed
+        return token, only, retry_failed, run_vars
+
+    def parse_var_arg(self, value: str) -> tuple[str, str]:
+        if "=" not in value:
+            raise RuntimeError(f"--var must be name=value: {value}")
+        name, item = value.split("=", 1)
+        name = name.strip()
+        if not name:
+            raise RuntimeError(f"--var name is empty: {value}")
+        return name, item
 
     def progress_callback(self, event: dict[str, Any]) -> None:
         if threading.get_ident() == self.ui_thread:
@@ -839,6 +1019,9 @@ class BatchAgentTui(App[None]):
         if self.progress_state is None:
             return
         self.progress_state.handle_event(event)
+        work_id = str(event.get("work_id") or "")
+        if work_id:
+            self.current_work_id = work_id
         task_id = str(event.get("task_id") or "")
         if task_id and not self.focus_task_id:
             self.focus_task_id = task_id
@@ -868,29 +1051,10 @@ class BatchAgentTui(App[None]):
         self.load_manifest(path)
 
     def resolve_manifest_token(self, token: str) -> Path:
-        if token.isdigit():
-            index = int(token)
-            if 1 <= index <= len(self.manifest_paths):
-                return self.manifest_paths[index - 1]
-            raise RuntimeError(f"manifest index out of range: {token}")
         direct = Path(token)
         if direct.exists():
             return direct
-        matches: list[Path] = []
-        for path in self.manifest_paths:
-            if token in {self.display_manifest_path(path), path.parent.name, str(path)}:
-                matches.append(path)
-                continue
-            try:
-                if load_manifest(path).config.name == token:
-                    matches.append(path)
-            except Exception:
-                pass
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
-            raise RuntimeError(f"ambiguous manifest token: {token}")
-        return direct
+        raise RuntimeError(f"manifest path not found: {token}")
 
     def load_manifest(self, path: Path) -> None:
         manifest = load_manifest(path)
@@ -905,7 +1069,7 @@ class BatchAgentTui(App[None]):
 
     def require_manifest(self) -> Manifest:
         if self.selected_manifest is None:
-            raise RuntimeError("No manifest selected. Use /show_batch <number|path>.")
+            raise RuntimeError("No manifest selected. Use /show_batch <manifest-path> or click a batch row.")
         return self.selected_manifest
 
     def require_progress(self) -> ProgressState:
