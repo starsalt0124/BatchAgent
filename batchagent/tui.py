@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from rich.panel import Panel
-from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
@@ -21,19 +21,33 @@ from .store import SessionStore
 from .util import console_safe, truncate
 
 
-COMMANDS = [
-    "/show_batch",
-    "/show_task",
-    "/history",
-    "/run",
-    "/retry",
-    "/rerun",
-    "/refresh",
-    "/show_home",
-    "/help",
-    "/quit",
-    "/exit",
+COMMAND_SPECS = [
+    ("/show_batch", "/show_batch <number|path|name>", "Select and inspect a batch manifest."),
+    ("/run", "/run [number|path|name] [--only task-id] [--retry-failed]", "Run eligible tasks; every attempt gets a new run directory."),
+    ("/show_task", "/show_task <task-id>", "Show the selected task row and live task detail."),
+    ("/history", "/history [task-id|all]", "Show persisted run history for the current batch."),
+    ("/retry", "/retry <task-id|all>", "Mark failed task(s) as retry without deleting prior history."),
+    ("/rerun", "/rerun <task-id>", "Reset task status to todo; prior run directories are kept."),
+    ("/refresh", "/refresh", "Reload manifests and current status."),
+    ("/show_home", "/show_home", "Return to the manifest list page."),
+    ("/help", "/help", "Show the home/help page."),
+    ("/quit", "/quit", "Exit the TUI."),
+    ("/exit", "/exit", "Exit the TUI."),
 ]
+COMMAND_META = {name: (usage, description) for name, usage, description in COMMAND_SPECS}
+COMMANDS = [name for name, _usage, _description in COMMAND_SPECS]
+
+
+class CommandInput(Input):
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "tab":
+            event.stop()
+            event.prevent_default()
+            complete = getattr(self.app, "action_complete_command", None)
+            if complete is not None:
+                complete()
+            return
+        await super()._on_key(event)
 
 
 class BatchAgentTui(App[None]):
@@ -52,14 +66,24 @@ class BatchAgentTui(App[None]):
     }
 
     #side {
-        width: 34;
-        min-width: 24;
+        width: 40;
+        min-width: 30;
         border-right: solid $surface;
         padding: 0 1;
     }
 
+    #side_title {
+        height: 3;
+    }
+
+    #selection {
+        height: 7;
+        border-bottom: solid $surface;
+        padding: 0 1;
+    }
+
     #title {
-        height: 5;
+        height: 6;
         border-bottom: solid $surface;
         padding: 0 1;
     }
@@ -73,8 +97,15 @@ class BatchAgentTui(App[None]):
         border-top: solid $surface;
     }
 
+    #command_palette {
+        display: none;
+        max-height: 9;
+        border-top: solid $surface;
+        padding: 0 1;
+    }
+
     #command {
-        dock: bottom;
+        height: 3;
     }
     """
 
@@ -83,7 +114,6 @@ class BatchAgentTui(App[None]):
         ("ctrl+q", "quit", "Quit"),
         ("f1", "help", "Help"),
         ("escape", "show_batch", "Batch"),
-        ("tab", "complete_command", "Complete"),
     ]
 
     def __init__(self, start_manifest: str | None = None):
@@ -109,12 +139,14 @@ class BatchAgentTui(App[None]):
         with Horizontal(id="body"):
             with Vertical(id="side"):
                 yield Static("", id="side_title")
+                yield Static("", id="selection")
                 yield DataTable(id="manifest_table")
             with Vertical(id="main"):
                 yield Static("", id="title")
                 yield DataTable(id="table")
                 yield RichLog(id="detail", wrap=True, highlight=False)
-        yield Input(placeholder="/help", id="command")
+        yield Static("", id="command_palette")
+        yield CommandInput(placeholder="Type / for commands. Tab completes.", id="command")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -148,25 +180,58 @@ class BatchAgentTui(App[None]):
             self.render_history()
 
     def render_sidebar(self) -> None:
-        self.query_one("#side_title", Static).update(
-            "BatchAgent\n\n/show_batch <#>\n/run <#|path>\n/show_task <id>\n/history [id]\nTab complete\n/quit"
-        )
+        self.query_one("#side_title", Static).update("Batches\nDiscovered manifests")
+        self.query_one("#selection", Static).update(self.selection_text())
         table = self.query_one("#manifest_table", DataTable)
         table.clear(columns=True)
-        table.add_columns("#", "Manifest", "State")
+        table.add_columns("Sel", "#", "Batch", "State")
         for index, path in enumerate(self.manifest_paths, start=1):
             state = ""
+            label = self.manifest_label(path)
             try:
                 counts = status(path)
                 state = " ".join(f"{key}:{value}" for key, value in sorted(counts.items()))
             except Exception:
                 state = "invalid"
-            table.add_row(str(index), path.name if len(str(path)) > 32 else str(path), state, key=str(index))
+            selected = "*" if self.selected_manifest_path and path.resolve() == self.selected_manifest_path.resolve() else ""
+            table.add_row(selected, str(index), label, state, key=str(index))
+
+    def selection_text(self) -> str:
+        if self.selected_manifest is None:
+            return "Current Batch\n\nNone selected\nUse /show_batch or /run."
+        return console_safe(
+            "\n".join(
+                [
+                    "Current Batch",
+                    self.selected_manifest.config.name,
+                    truncate(self.display_manifest_path(self.selected_manifest.path), 64),
+                    f"page: {self.page}",
+                ]
+            )
+        )
+
+    def manifest_label(self, path: Path) -> str:
+        try:
+            manifest = load_manifest(path)
+            return truncate(manifest.config.name or path.parent.name or path.name, 28)
+        except Exception:
+            return truncate(path.parent.name or path.name, 28)
+
+    def selected_batch_line(self) -> str:
+        if self.selected_manifest is None:
+            return "Selected batch: none"
+        return f"Selected batch: {self.selected_manifest.config.name} ({self.display_manifest_path(self.selected_manifest.path)})"
 
     def render_home(self) -> None:
         self.query_one("#title", Static).update(
             Panel(
-                "Home\n\nUse /show_batch <number> to inspect a manifest, /run <number> to execute, /quit to exit.",
+                "\n".join(
+                    [
+                        "Home",
+                        self.selected_batch_line(),
+                        "Type / for commands; Tab completes the current token.",
+                    ]
+                ),
                 title="BatchAgent",
             )
         )
@@ -182,15 +247,15 @@ class BatchAgentTui(App[None]):
             table.add_row(str(index), str(path), summary, key=str(index))
         self.set_detail(
             [
-                "Commands:",
-                "  /show_batch <number|path>",
-                "  /run <number|path> [--only task-id] [--retry-failed]",
-                "  /show_task <task-id>",
-                "  /history [task-id]",
-                "  /refresh",
-                "  /quit",
+                "Screen areas:",
+                "  Left sidebar: discovered batch manifests and the current selected batch.",
+                "  Top panel: current page and selected batch context.",
+                "  Center table: the primary list for the current page.",
+                "  Lower detail: focused task, history, or page-specific detail.",
+                "  Bottom candidate area: command suggestions while typing.",
+                "  Bottom input: enter commands; type / to show all commands.",
                 "",
-                "Tab completes commands, manifest tokens, and task ids.",
+                "Tab completes the current command, batch token, option, or task id.",
             ]
         )
 
@@ -201,6 +266,7 @@ class BatchAgentTui(App[None]):
             Panel(
                 "\n".join(
                     [
+                        self.selected_batch_line(),
                         f"Manifest: {manifest.path}",
                         f"Name: {manifest.config.name}",
                         f"Model: {manifest.config.provider}/{manifest.config.model}",
@@ -225,14 +291,10 @@ class BatchAgentTui(App[None]):
             )
         self.set_detail(
             [
-                "Batch commands:",
-                "  /run                       run eligible tasks in this manifest",
-                "  /run --only <task-id>       run one task",
-                "  /show_task <task-id>        inspect task details",
-                "  /history [task-id]          show persisted run history",
-                "  /retry <task-id|all>        mark failed task(s) retry",
-                "  /rerun <task-id>            reset task to todo",
-                "  /show_home                  manifest list",
+                "Batch page:",
+                "  The center table lists tasks from the selected batch.",
+                "  The Output/Error column shows the latest manifest result or error.",
+                "  Type / in the bottom input for commands and examples.",
                 "",
                 "Every /run attempt creates a new .batchagent/runs/<task>-<run_id> directory; old results stay available in /history.",
             ]
@@ -250,6 +312,7 @@ class BatchAgentTui(App[None]):
             Panel(
                 "\n".join(
                     [
+                        self.selected_batch_line(),
                         f"Run: {state.manifest.path}",
                         f"loaded={state.total_tasks} eligible={state.eligible_tasks} running={running} queued={queued} done={done} failed={failed}",
                         f"elapsed={_format_seconds(state.elapsed())} eta={'unknown' if eta is None else _format_seconds(eta)}",
@@ -283,6 +346,7 @@ class BatchAgentTui(App[None]):
         manifest = self.require_manifest()
         rows = self.history_rows(self.history_task_id or None)
         title_lines = [
+            self.selected_batch_line(),
             f"Manifest: {manifest.path}",
             f"History: {self.history_task_id or 'all tasks'}",
             "Each run has an immutable run_id and a separate run directory.",
@@ -306,11 +370,10 @@ class BatchAgentTui(App[None]):
         self.set_detail(
             [
                 f"history rows: {len(rows)}",
-                "Commands:",
-                "  /history                 show all recent runs for this manifest",
-                "  /history <task-id>       show run history for one task",
-                "  /show_task <task-id>     inspect current manifest row and live details",
-                "  /run [--only task-id]    create a new run directory and keep prior results",
+                "History page:",
+                "  Rows are persisted SQLite run records for the selected batch.",
+                "  The manifest stores the latest result, while this page keeps prior runs visible.",
+                "  Type /history <task-id> or /show_task <task-id> in the bottom input.",
             ]
         )
 
@@ -350,9 +413,17 @@ class BatchAgentTui(App[None]):
         command = event.value.strip()
         event.input.value = ""
         self.reset_completion()
+        self.render_command_palette("")
         if not command:
             return
         await self.handle_command(command)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "command":
+            return
+        if event.value != self._completion_value:
+            self.reset_completion()
+        self.render_command_palette(event.value)
 
     def action_complete_command(self) -> None:
         command_input = self.query_one("#command", Input)
@@ -376,6 +447,44 @@ class BatchAgentTui(App[None]):
         self._completion_value = next_value
         command_input.value = next_value
         command_input.cursor_position = len(next_value)
+
+    def render_command_palette(self, value: str) -> None:
+        palette = self.query_one("#command_palette", Static)
+        lines = self.command_palette_lines(value)
+        if not lines:
+            palette.update("")
+            palette.display = False
+            return
+        palette.display = True
+        palette.update(Panel(console_safe("\n".join(lines)), title="Command Candidates"))
+
+    def command_palette_lines(self, value: str) -> list[str]:
+        if not value.startswith("/"):
+            return []
+        candidates = self.completion_candidates(value)
+        if value.strip() == "/":
+            return [self.describe_candidate(value, name) for name in COMMANDS]
+        if not candidates:
+            return ["No matching command, batch, option, or task."]
+        return [self.describe_candidate(value, candidate) for candidate in candidates[:8]]
+
+    def describe_candidate(self, value: str, candidate: str) -> str:
+        if candidate in COMMAND_META:
+            usage, description = COMMAND_META[candidate]
+            return f"{usage} - {description}"
+        if candidate == "--only":
+            return "--only <task-id> - Run exactly one task from the selected/current batch."
+        if candidate == "--retry-failed":
+            return "--retry-failed - Treat failed tasks as eligible for this run."
+        if candidate == "all":
+            return "all - Apply to all relevant tasks or show all run history."
+        task = self.task_for_token(candidate)
+        if task is not None:
+            return f"{candidate} - task: status={task.status}, kind={task.kind or '-'}, attempts={task.attempts}"
+        manifest = self.manifest_for_token(candidate)
+        if manifest is not None:
+            return f"{candidate} - batch: {manifest.config.name} ({self.display_manifest_path(manifest.path)})"
+        return candidate
 
     def completion_candidates(self, text: str) -> list[str]:
         before, token = self.split_completion_token(text)
@@ -461,11 +570,35 @@ class BatchAgentTui(App[None]):
                 pass
         return [token for token in tokens if token]
 
+    def manifest_for_token(self, token: str) -> Manifest | None:
+        matches: list[Manifest] = []
+        for index, path in enumerate(self.manifest_paths, start=1):
+            try:
+                manifest = load_manifest(path)
+            except Exception:
+                continue
+            aliases = {
+                str(index),
+                self.display_manifest_path(path),
+                path.parent.name,
+                str(path),
+                manifest.config.name,
+            }
+            if token in aliases:
+                matches.append(manifest)
+        return matches[0] if len(matches) == 1 else None
+
     def task_completion_tokens(self) -> list[str]:
         manifest = self.selected_manifest
         if manifest is None:
             return []
         return [task.id for task in manifest.tasks]
+
+    def task_for_token(self, token: str) -> Task | None:
+        manifest = self.selected_manifest
+        if manifest is None:
+            return None
+        return next((task for task in manifest.tasks if task.id == token), None)
 
     def display_manifest_path(self, path: Path) -> str:
         try:

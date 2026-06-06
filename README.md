@@ -148,6 +148,15 @@ Run without arguments to enter the full-screen Textual TUI. BatchAgent will disc
 python -m batchagent
 ```
 
+TUI layout:
+
+- Left sidebar: discovered batch manifests plus the current selected batch.
+- Top panel: current page and selected batch context.
+- Center table: manifest list, task list, run dashboard, or history rows.
+- Lower detail: focused task output, page detail, or history notes.
+- Bottom candidate area: command and argument suggestions while typing.
+- Bottom input: command entry.
+
 Core TUI commands:
 
 ```text
@@ -161,7 +170,7 @@ Core TUI commands:
 /quit
 ```
 
-Press `Tab` in the TUI command input to complete command names, discovered batch manifests, and task ids from the selected manifest.
+Type `/` in the TUI command input to show commands with usage examples and descriptions. Press `Tab` to complete the current command, discovered batch manifest, option, or task id from the selected manifest.
 
 You can also start the same TUI with an explicit manifest:
 

@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from textual.widgets import Input
+
 from batchagent.manifest import create_sample_manifest
 from batchagent.tui import BatchAgentTui
 
@@ -50,6 +52,34 @@ class TuiTests(unittest.TestCase):
                 asyncio.run(run())
             finally:
                 os.chdir(previous)
+
+    def test_tab_completes_inside_command_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            try:
+                os.chdir(tmp)
+                create_sample_manifest("BATCHAGENT.md")
+
+                async def run() -> None:
+                    app = BatchAgentTui()
+                    async with app.run_test(size=(100, 30)) as pilot:
+                        command = app.query_one("#command", Input)
+                        command.focus()
+                        command.value = "/sho"
+                        await pilot.press("tab")
+                        self.assertEqual(command.value, "/show_batch")
+                        self.assertTrue(command.has_focus)
+                        await app.handle_command("/quit")
+
+                asyncio.run(run())
+            finally:
+                os.chdir(previous)
+
+    def test_command_palette_describes_slash_commands(self) -> None:
+        app = BatchAgentTui()
+        lines = app.command_palette_lines("/")
+        self.assertTrue(any("/history [task-id|all]" in line for line in lines))
+        self.assertTrue(any("/run [number|path|name]" in line for line in lines))
 
     def test_history_rows_do_not_create_state_db(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
