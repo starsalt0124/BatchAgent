@@ -188,7 +188,7 @@ Core TUI commands:
 /history [run-id]
 /retry <task-id>
 /rerun <task-id>
-/harness [use|reset|doctor] [native|opencode|claude]
+/harness [use|reset|doctor] [built-in|opencode|claudecode|codex]
 /theme [name]
 /refresh
 /quit
@@ -284,7 +284,7 @@ bagent rerun BATCHAGENT.md task-id
 
 ## Local Harnesses
 
-The default `native` harness uses BatchAgent's OpenAI-compatible provider loop. `opencode` and `claude` execute the Task through an installed local OpenCode or Claude Code CLI in a background subprocess while the TUI remains responsive.
+The default `built-in` harness uses BatchAgent's OpenAI-compatible provider loop. `opencode`, `claudecode`, and `codex` execute the Task through an installed local CLI in a background subprocess while the TUI remains responsive. Persisted values `native` and `claude` remain supported aliases for compatibility.
 
 ```text
 /harness
@@ -293,7 +293,9 @@ The default `native` harness uses BatchAgent's OpenAI-compatible provider loop. 
 /harness reset
 ```
 
-The selection is saved in `~/.bagent/settings.json` and frozen into each new Run together with the execution config. Resume uses that snapshot even if the manifest prompt or harness command was edited later; the CLI's explicit `resume --harness ...` option is an intentional override. A manifest can set the default with a string or table:
+Entering `/harness` without arguments opens a keyboard-selectable table with `built-in`, `opencode`, `claudecode`, and `codex`. The table shows availability, detected version, executable, and a literal `CURRENT` marker for the selected harness. Press Enter on an available row to select it. The sidebar also shows the current harness on every TUI page.
+
+The selection is saved in `~/.bagent/settings.json` and passed explicitly to each new Run started from the TUI. Resume uses the Run snapshot even if the selected harness, manifest prompt, or harness command changes later; `resume --harness ...` is an intentional override. For non-interactive CLI runs without `--harness`, a manifest can set its default with a string or table:
 
 ```toml
 harness = "opencode"
@@ -306,7 +308,7 @@ harness = "opencode"
 # env_allowlist = ["ANTHROPIC_API_KEY"]
 ```
 
-For OpenCode and Claude Code, BatchAgent injects a run-scoped MCP server with `submit_artifact` and `report_progress`. It never silently enables OpenCode `--auto` or Claude permission-bypass flags, and inline shell/interpreter command prefixes are rejected. Probes run with a minimal environment in a neutral temporary directory. The external CLI keeps its own authentication and session id; those are never confused with `run_id` or `attempt_id`.
+For OpenCode, Claude Code, and Codex, BatchAgent injects a run-scoped MCP server with `submit_artifact` and `report_progress`. Codex runs with its `workspace-write` sandbox and receives MCP overrides only for that process, so the user's global Codex config is not modified. BatchAgent never silently enables OpenCode `--auto`, Claude permission-bypass flags, or Codex sandbox/approval bypass flags; inline shell/interpreter command prefixes are also rejected. Probes run with a minimal environment in a neutral temporary directory. The external CLI keeps its own authentication and session id; those are never confused with `run_id` or `attempt_id`.
 
 ## Tools Exposed to Agents
 

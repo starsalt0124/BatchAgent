@@ -1935,7 +1935,7 @@ def _usage_tokens(usage: Mapping[str, Any]) -> dict[str, int | None]:
         total = (prompt or 0) + (completion or 0)
     prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), Mapping) else {}
     completion_details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), Mapping) else {}
-    cached = _first_int(usage, "cached_tokens", "cache_read_input_tokens")
+    cached = _first_int(usage, "cached_tokens", "cached_input_tokens", "cache_read_input_tokens")
     if cached is None:
         cached = _first_int(prompt_details, "cached_tokens")
     reasoning = _first_int(usage, "reasoning_tokens")

@@ -37,7 +37,7 @@ class SchedulerControlsTests(unittest.TestCase):
 
             validate_manifest(manifest, harness_name="opencode")
             with self.assertRaisesRegex(RuntimeError, "native harness requires submit_artifact"):
-                validate_manifest(manifest, harness_name="native")
+                validate_manifest(manifest, harness_name="built-in")
 
     def test_state_path_auto_imports_manifest_legacy_run_database(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

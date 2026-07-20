@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from textual.widgets import DataTable, Input
 
+from batchagent.harness import HarnessProbe
 from batchagent.manifest import create_sample_manifest, load_manifest
 from batchagent.progress import ProgressState
 from batchagent.scheduler import state_db_path
@@ -38,6 +39,9 @@ class TuiTests(unittest.TestCase):
                 self.assertIn("demo-1", app.completion_candidates("/show_task demo"))
                 self.assertIn("demo-2", app.completion_candidates("/run --only demo"))
                 self.assertIn("opencode", app.completion_candidates("/harness use o"))
+                self.assertIn("built-in", app.completion_candidates("/harness use b"))
+                self.assertIn("claudecode", app.completion_candidates("/harness use c"))
+                self.assertIn("codex", app.completion_candidates("/run --harness c"))
             finally:
                 os.chdir(previous)
 
@@ -494,6 +498,77 @@ class TuiTests(unittest.TestCase):
                 restarted = BatchAgentTui()
                 self.assertEqual(restarted.theme, "textual-light")
                 self.assertEqual(restarted.harness_name, "native")
+
+    def test_harness_command_opens_selectable_list_and_marks_current_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+
+            async def fake_probe(name: str, _config=None) -> HarnessProbe:
+                return HarnessProbe(
+                    name=name,
+                    available=True,
+                    executable=name,
+                    version=f"{name} 1.0",
+                )
+
+            with patch.dict(os.environ, {"BAGENT_HOME": str(home)}), patch(
+                "batchagent.tui.probe_harness",
+                new=fake_probe,
+            ):
+                async def run() -> None:
+                    app = BatchAgentTui()
+                    async with app.run_test(size=(140, 36)):
+                        await app.handle_command("/harness")
+                        self.assertEqual(app.page, "harness")
+                        table = app.query_one("#table", DataTable)
+                        self.assertEqual(table.row_count, 4)
+                        self.assertEqual(str(table.get_row("harness:native")[0]), "CURRENT")
+                        self.assertEqual(str(table.get_row("harness:codex")[1]), "codex")
+                        self.assertIn("harness: built-in", app.selection_text())
+
+                        app.on_data_table_row_selected(
+                            SimpleNamespace(row_key=SimpleNamespace(value="harness:codex"))
+                        )
+                        self.assertEqual(app.harness_name, "codex")
+                        self.assertEqual(str(table.get_row("harness:codex")[0]), "CURRENT")
+                        self.assertIn("harness: codex", app.selection_text())
+                        await app.handle_command("/quit")
+
+                asyncio.run(run())
+                self.assertEqual(load_settings()["harness"], "codex")
+
+    def test_selected_harness_is_used_for_the_next_tui_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            home = Path(tmp) / "home"
+            call: dict[str, object] = {}
+
+            async def fake_run_manifest(*_args, **kwargs):
+                call.update(kwargs)
+                return []
+
+            try:
+                os.chdir(tmp)
+                create_sample_manifest("BATCHAGENT.md")
+                with patch.dict(os.environ, {"BAGENT_HOME": str(home)}), patch(
+                    "batchagent.tui.run_manifest",
+                    new=fake_run_manifest,
+                ):
+                    async def run() -> None:
+                        app = BatchAgentTui("BATCHAGENT.md")
+                        async with app.run_test(size=(100, 30)) as pilot:
+                            app.harness_name = "codex"
+                            await app.command_run([])
+                            assert app.run_task is not None
+                            await app.run_task
+                            await pilot.pause()
+                            self.assertEqual(call["harness"], "codex")
+                            self.assertEqual(app.page, "batch")
+                            await app.handle_command("/quit")
+
+                    asyncio.run(run())
+            finally:
+                os.chdir(previous)
 
     def test_theme_command_repairs_corrupt_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

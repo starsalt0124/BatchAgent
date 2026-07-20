@@ -38,7 +38,7 @@ Core modules:
 - `batchagent.manifest`: fenced TOML config and Markdown task table parsing/writeback.
 - `batchagent.scheduler`: concurrency, leases, retries, stale recovery, status counts.
 - `batchagent.agent`: OpenAI-compatible tool-calling loop.
-- `batchagent.harness`: native/OpenCode/Claude adapter registry and subprocess lifecycle.
+- `batchagent.harness`: built-in/OpenCode/Claude Code/Codex adapter registry and subprocess lifecycle.
 - `batchagent.harness_mcp`: run-scoped `submit_artifact` and progress tools for external harnesses.
 - `batchagent.provider`: DeepSeek/OpenAI-compatible HTTP client.
 - `batchagent.tools`: workspace-limited tools exposed to the model.
@@ -161,11 +161,11 @@ Batch execution has no per-turn human approval, so safety is deny-heavy:
 - Delete commands, shell interpreter commands, reboot/format/registry commands, and configured `blocked_command_patterns` are rejected.
 - Absolute command path arguments must stay inside the workspace or run directory.
 - `command_clean_env = true` avoids leaking API keys and unrelated environment variables into command tools.
-- External harnesses receive a minimal environment plus explicit allowlisted names. Probes use a neutral temporary working directory; inline interpreter evaluation, OpenCode `--auto`, and Claude permission-bypass flags are rejected.
+- External harnesses receive a minimal environment plus explicit allowlisted names. Probes use a neutral temporary working directory; inline interpreter evaluation, OpenCode `--auto`, Claude permission-bypass flags, and Codex sandbox/approval bypass flags are rejected.
 
 ## Local Harness Protocol
 
-`native` runs the built-in provider loop. `opencode` and `claude` use argument-array subprocesses with concurrent stdout/stderr consumption, process-group timeout/cancel cleanup, and tolerant JSONL parsing. Each Attempt receives a private MCP spool containing:
+`built-in` (`native`) runs the internal provider loop. `opencode`, `claudecode` (`claude`), and `codex` use argument-array subprocesses with concurrent stdout/stderr consumption, process-group timeout/cancel cleanup, and tolerant JSONL parsing. Codex is pinned to its `workspace-write` sandbox and receives run-scoped `mcp_servers.bagent` CLI overrides instead of changes to the user's global config. Each Attempt receives a private MCP spool containing:
 
 - `submit_artifact(summary, artifact_path, metadata)`
 - `report_progress(message, percent, metadata)`

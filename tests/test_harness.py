@@ -11,11 +11,16 @@ from pathlib import Path
 
 from batchagent.harness import (
     ClaudeCodeHarness,
+    CodexHarness,
     HarnessError,
     HarnessRequest,
     OpenCodeHarness,
+    _handle_json_event,
+    _StreamState,
     available_harnesses,
+    canonical_harness_name,
     get_harness,
+    harness_display_names,
 )
 from batchagent.manifest import create_sample_manifest, load_manifest
 from batchagent.models import BatchConfig, HarnessConfig, Task
@@ -49,13 +54,28 @@ if mode == "sleep":
     time.sleep(60)
     raise SystemExit(0)
 
-if mode == "submit":
-    inline = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])
-    mcp = inline["mcp"]["bagent"]
+if mode in {"submit", "codex_submit"}:
+    if mode == "submit":
+        inline = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])
+        mcp = inline["mcp"]["bagent"]
+        mcp_command = mcp["command"]
+        mcp_environment = mcp["environment"]
+    else:
+        import tomllib
+        overrides = {}
+        for index, arg in enumerate(sys.argv[:-1]):
+            if arg == "-c":
+                key, value = sys.argv[index + 1].split("=", 1)
+                overrides[key] = value
+        mcp_command = [
+            json.loads(overrides["mcp_servers.bagent.command"]),
+            *json.loads(overrides["mcp_servers.bagent.args"]),
+        ]
+        mcp_environment = tomllib.loads("value=" + overrides["mcp_servers.bagent.env"])["value"]
     child_env = os.environ.copy()
-    child_env.update(mcp["environment"])
+    child_env.update(mcp_environment)
     server = subprocess.Popen(
-        mcp["command"],
+        mcp_command,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -148,14 +168,111 @@ class HarnessTests(unittest.TestCase):
         )
 
     def test_registry_and_probe(self) -> None:
-        self.assertEqual(available_harnesses(), ["claude", "native", "opencode"])
+        self.assertEqual(available_harnesses(), ["native", "opencode", "claude", "codex"])
+        self.assertEqual(harness_display_names(), ["built-in", "opencode", "claudecode", "codex"])
+        self.assertEqual(canonical_harness_name("built-in"), "native")
+        self.assertEqual(canonical_harness_name("claudecode"), "claude")
         self.assertIs(get_harness("claude-code"), get_harness("claude"))
+        self.assertIs(get_harness("codex-cli"), get_harness("codex"))
         self.assertTrue(asyncio.run(get_harness("native").probe()).available)
         with tempfile.TemporaryDirectory() as tmp:
             script = _write_fake(Path(tmp) / "fake.py")
             probe = asyncio.run(OpenCodeHarness().probe(HarnessConfig(command=[sys.executable, str(script)])))
             self.assertTrue(probe.available)
             self.assertEqual(probe.version, "fake-harness 1.2.3")
+
+    def test_codex_builds_sandboxed_json_invocation_with_scoped_mcp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = _write_fake(root / "fake.py")
+            request = self.make_request(root, script, name="codex", inject_tools=True, require_submit=True)
+            invocation = asyncio.run(CodexHarness().build_invocation(request))
+
+            self.assertNotIn("secret prompt text", " ".join(invocation.command))
+            self.assertIn("exec", invocation.command)
+            self.assertIn("--json", invocation.command)
+            self.assertIn("workspace-write", invocation.command)
+            self.assertNotIn("danger-full-access", invocation.command)
+            self.assertEqual(invocation.command[-1], "-")
+            overrides = [
+                invocation.command[index + 1]
+                for index, item in enumerate(invocation.command[:-1])
+                if item == "-c"
+            ]
+            self.assertTrue(any(value.startswith("mcp_servers.bagent.command=") for value in overrides))
+            self.assertTrue(any("BAGENT_ATTEMPT_ID" in value and "attempt-1" in value for value in overrides))
+            self.assertIn(
+                'mcp_servers.bagent.enabled_tools=["submit_artifact","report_progress"]',
+                overrides,
+            )
+
+    def test_codex_json_events_preserve_thread_usage_text_and_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = _write_fake(root / "fake.py")
+            request = self.make_request(root, script, name="codex")
+            events: list[dict] = []
+            request.progress_callback = events.append
+            state = _StreamState()
+
+            _handle_json_event(request, "codex", state, {"type": "thread.started", "thread_id": "thread-123"})
+            _handle_json_event(
+                request,
+                "codex",
+                state,
+                {"type": "item.completed", "item": {"type": "agent_message", "text": "finished"}},
+            )
+            _handle_json_event(
+                request,
+                "codex",
+                state,
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "bagent",
+                        "tool": "submit_artifact",
+                        "status": "completed",
+                        "arguments": {"summary": "done"},
+                        "result": {"accepted": True},
+                    },
+                },
+            )
+            _handle_json_event(
+                request,
+                "codex",
+                state,
+                {
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 5, "cached_input_tokens": 2, "output_tokens": 3},
+                },
+            )
+
+            self.assertEqual(state.session_id, "thread-123")
+            self.assertEqual(state.usage["cached_input_tokens"], 2)
+            self.assertTrue(any(event["type"] == "model_delta" and event["delta"] == "finished" for event in events))
+            self.assertTrue(
+                any(event["type"] == "tool_finished" and event["tool"] == "bagent.submit_artifact" for event in events)
+            )
+
+    def test_codex_runs_with_injected_mcp_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = _write_fake(root / "fake.py")
+            request = self.make_request(
+                root,
+                script,
+                name="codex",
+                inject_tools=True,
+                require_submit=True,
+                environment={"FAKE_MODE": "codex_submit"},
+            )
+
+            result = asyncio.run(CodexHarness().run(request))
+
+            self.assertTrue(result.success, result.error)
+            self.assertEqual(result.submission.summary, "fake done")
+            self.assertEqual(result.submission.metadata, {"source": "fake"})
 
     def test_manifest_parses_harness_table(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -244,6 +361,11 @@ class HarnessTests(unittest.TestCase):
             request.config.harness.extra_args = ["--dangerously-skip-permissions=true"]
             with self.assertRaises(HarnessError):
                 asyncio.run(ClaudeCodeHarness().build_invocation(request))
+
+            request.config.harness.name = "codex"
+            request.config.harness.extra_args = ["--sandbox=danger-full-access"]
+            with self.assertRaises(HarnessError):
+                asyncio.run(CodexHarness().build_invocation(request))
 
             unsafe = HarnessConfig(
                 name="opencode",

@@ -16,7 +16,15 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
-from .harness import available_harnesses, probe_harness
+from .harness import (
+    HarnessError,
+    HarnessProbe,
+    canonical_harness_name,
+    harness_catalog,
+    harness_display_name,
+    harness_display_names,
+    probe_harness,
+)
 from .manifest import ManifestError, load_manifest
 from .models import Manifest, RunVariable, Task
 from .progress import ProgressState, _format_seconds
@@ -44,7 +52,7 @@ COMMAND_SPECS = [
     ("/history", "/history [run-id]", "Alias for the current Batch's Run list or one Run."),
     ("/retry", "/retry <task-id>", "Execute a new Attempt for a failed Task in the selected Run."),
     ("/rerun", "/rerun <task-id>", "Create a new Run containing the selected Task."),
-    ("/harness", "/harness [use|reset|doctor] [name]", "Show or persist the local task harness."),
+    ("/harness", "/harness [use|reset|doctor] [name]", "Open the harness list or persist a selection."),
     ("/theme", "/theme [name]", "Show or persist the Textual color theme."),
     ("/refresh", "/refresh", "Reload manifests and current status."),
     ("/show_home", "/show_home", "Return to the manifest list page."),
@@ -265,7 +273,7 @@ class BatchAgentTui(App[None]):
     }
 
     #title {
-        height: 6;
+        height: 8;
         border-bottom: solid $surface;
         padding: 0 1;
     }
@@ -329,7 +337,12 @@ class BatchAgentTui(App[None]):
         self.selected_run_id = ""
         self.active_run_id = ""
         self.active_manifest_path: Path | None = None
-        self.harness_name = str(self.settings.get("harness") or "native")
+        try:
+            self.harness_name = canonical_harness_name(str(self.settings.get("harness") or "native"))
+        except HarnessError as exc:
+            self.harness_name = "native"
+            self.settings_error = self.settings_error or str(exc)
+        self.harness_probes: dict[str, HarnessProbe] = {}
         self.ui_thread = 0
         self.history_task_id = ""
         self._completion_value = ""
@@ -405,6 +418,8 @@ class BatchAgentTui(App[None]):
             self.render_run()
         elif self.page == "history":
             self.render_history()
+        elif self.page == "harness":
+            self.render_harness()
 
     def action_copy(self) -> None:
         focused = self.focused
@@ -433,7 +448,10 @@ class BatchAgentTui(App[None]):
 
     def selection_text(self) -> str:
         if self.selected_manifest is None:
-            return "Current Batch\n\nNone selected\nUse /show_batch or /run."
+            return (
+                "Current Batch\n\nNone selected\nUse /show_batch or /run.\n"
+                f"harness: {harness_display_name(self.harness_name)}"
+            )
         return console_safe(
             "\n".join(
                 [
@@ -442,6 +460,7 @@ class BatchAgentTui(App[None]):
                     truncate(self.display_manifest_path(self.selected_manifest.path), 64),
                     f"selected run: {self.selected_run_id or '(none)'}",
                     f"active run: {self.active_run_id or '(none)'}",
+                    f"harness: {harness_display_name(self.harness_name)}",
                     f"page: {self.page}",
                 ]
             )
@@ -507,7 +526,7 @@ class BatchAgentTui(App[None]):
                         f"Manifest: {manifest.path}",
                         f"Name: {manifest.config.name}",
                         f"Runs: {len(rows)}",
-                        f"Default harness: {self.harness_name}",
+                        f"Default harness: {harness_display_name(self.harness_name)}",
                         "Select a Run to inspect its Tasks, or use /run to create one.",
                     ]
                 ),
@@ -522,7 +541,7 @@ class BatchAgentTui(App[None]):
             table.add_row(
                 str(row["run_id"]),
                 str(row["status"]),
-                str(row.get("harness") or "native"),
+                harness_display_name(str(row.get("harness") or "native")),
                 str(len(row.get("selected_task_ids") or [])),
                 _format_seconds(float(row.get("elapsed_seconds") or 0)),
                 str(row.get("total_tokens") if row.get("total_tokens") is not None else "-"),
@@ -540,6 +559,53 @@ class BatchAgentTui(App[None]):
             ]
         )
 
+    def render_harness(self) -> None:
+        current = harness_display_name(self.harness_name)
+        self.query_one("#title", Static).update(
+            Panel(
+                "\n".join(
+                    [
+                        "Harnesses",
+                        f"Current selection: {current}",
+                        "Select an available row to use it for the next Run.",
+                        "The selected harness is saved in ~/.bagent/settings.json.",
+                    ]
+                ),
+                title="Harness Selection",
+            )
+        )
+        table = self.query_one("#table", DataTable)
+        table.clear(columns=True)
+        table.add_columns("Selected", "Harness", "Availability", "Version", "Executable", "Description")
+        for item in harness_catalog():
+            name = item["name"]
+            probe = self.harness_probes.get(name)
+            if probe is None:
+                availability = "checking"
+                version = ""
+                executable = item["executable"]
+            else:
+                availability = "available" if probe.available else "unavailable"
+                version = probe.version or probe.error
+                executable = probe.executable or item["executable"]
+            table.add_row(
+                "CURRENT" if name == self.harness_name else "",
+                item["display_name"],
+                availability,
+                truncate(version, 72),
+                executable,
+                item["description"],
+                key=f"harness:{name}",
+            )
+        self.set_detail(
+            [
+                f"Current harness: {current}",
+                "Press Enter on an available row to select it.",
+                "Use /harness doctor <name> to refresh one availability check.",
+                "Aliases remain compatible: native = built-in, claude = claudecode.",
+            ]
+        )
+
     def render_run(self) -> None:
         if not (self.run_task and not self.run_task.done() and self.selected_run_id == self.active_run_id):
             self.render_persisted_run()
@@ -551,19 +617,26 @@ class BatchAgentTui(App[None]):
         failed = counts.get("failed", 0)
         running = counts.get("running", 0)
         queued = counts.get("queued", 0)
+        pause_text = (
+            state.pause_detail
+            if state.paused
+            else ("pause requested: waiting for running task(s) to finish" if self.pause_requested else "")
+        )
+        title_lines = [
+            self.selected_batch_line(),
+            f"Run: {state.work_id or self.active_run_id or '(pending)'}  "
+            f"Harness: {harness_display_name(state.harness or self.harness_name)}",
+            f"loaded={state.total_tasks} selected={state.eligible_tasks} running={running} "
+            f"queued={queued} done={done} failed={failed}",
+            f"elapsed={_format_seconds(state.elapsed())} "
+            f"eta={'unknown' if eta is None else _format_seconds(eta)}",
+        ]
+        if pause_text:
+            title_lines.append(pause_text)
+        title_lines.append("Attempt directories are unique; earlier results are preserved.")
         self.query_one("#title", Static).update(
             Panel(
-                "\n".join(
-                    [
-                        self.selected_batch_line(),
-                        f"Run: {state.work_id or self.active_run_id or '(pending)'}",
-                        f"Config: {state.manifest.path}",
-                        f"loaded={state.total_tasks} selected={state.eligible_tasks} running={running} queued={queued} done={done} failed={failed}",
-                        f"elapsed={_format_seconds(state.elapsed())} eta={'unknown' if eta is None else _format_seconds(eta)}",
-                        state.pause_detail if state.paused else ("pause requested: waiting for running task(s) to finish" if self.pause_requested else ""),
-                        "run dirs are unique per attempt; existing task results are not overwritten on disk",
-                    ]
-                ),
+                "\n".join(title_lines),
                 title="Run → Tasks (live)",
             )
         )
@@ -593,7 +666,8 @@ class BatchAgentTui(App[None]):
                     [
                         self.selected_batch_line(),
                         f"Run: {run_id}",
-                        f"Status: {run['status']}  Harness: {run['harness']} {run.get('harness_version') or ''}",
+                        f"Status: {run['status']}  Harness: "
+                        f"{harness_display_name(str(run['harness']))} {run.get('harness_version') or ''}",
                         f"Started: {run['started_at']}  Finished: {run.get('finished_at') or '-'}",
                         f"Elapsed: {_format_seconds(float(run.get('elapsed_seconds') or 0))}  Tokens: {run.get('total_tokens') if run.get('total_tokens') is not None else '-'}",
                         f"Tasks: {len(tasks)}  Variables: {json.dumps(run.get('run_vars') or {}, ensure_ascii=False)}",
@@ -772,6 +846,12 @@ class BatchAgentTui(App[None]):
             except Exception as exc:
                 self.notify(str(exc), severity="error")
             return
+        if key.startswith("harness:"):
+            try:
+                self.select_harness(key.removeprefix("harness:"))
+            except Exception as exc:
+                self.notify(str(exc), severity="error")
+            return
         if key.startswith("task:"):
             try:
                 self.open_task_detail(key.removeprefix("task:"), run_id=self.active_run_id or self.selected_run_id)
@@ -882,8 +962,12 @@ class BatchAgentTui(App[None]):
             return "--retry-failed - Include failed Tasks when resuming; compatibility-only for a new Run."
         if candidate == "all":
             return "all - Apply to all relevant tasks or show all run history."
-        if candidate in available_harnesses():
-            return f"{candidate} - local task harness"
+        try:
+            harness_name = canonical_harness_name(candidate)
+        except HarnessError:
+            pass
+        else:
+            return f"{harness_display_name(harness_name)} - local task harness"
         if candidate in self.available_themes:
             return f"{candidate} - Textual color theme"
         if candidate in self.run_completion_tokens():
@@ -913,8 +997,8 @@ class BatchAgentTui(App[None]):
         if command == "/harness":
             tokens = before.strip().split()
             if tokens and tokens[-1] in {"use", "doctor"}:
-                return self.filter_candidates(available_harnesses(), token)
-            return self.filter_candidates(["use", "reset", "doctor", *available_harnesses()], token)
+                return self.filter_candidates(harness_display_names(), token)
+            return self.filter_candidates(["use", "reset", "doctor", *harness_display_names()], token)
         if command == "/theme":
             return self.filter_candidates(sorted(self.available_themes), token)
         return []
@@ -924,7 +1008,7 @@ class BatchAgentTui(App[None]):
         if tokens and tokens[-1] in {"--only", "--focus"}:
             return self.filter_candidates(self.task_completion_tokens(), token)
         if tokens and tokens[-1] == "--harness":
-            return self.filter_candidates(available_harnesses(), token)
+            return self.filter_candidates(harness_display_names(), token)
         if tokens and tokens[-1] in {"--var", "--limit"}:
             return []
         option_candidates = ["--only", "--retry-failed", "--limit", "--focus", "--var", "--harness"]
@@ -1203,7 +1287,6 @@ class BatchAgentTui(App[None]):
         self.history_task_id = ""
         self._run_table_keys = []
         self.page = "run"
-        self.render_page()
         if resume_id:
             coroutine = resume_manifest(
                 manifest.path,
@@ -1222,12 +1305,13 @@ class BatchAgentTui(App[None]):
                 task_ids=only,
                 run_id=run_id,
                 run_vars=run_vars,
-                harness=harness,
+                harness=harness or self.harness_name,
                 progress_callback=self.progress_callback,
                 pause_event=self.pause_event,
             )
         self.run_task = asyncio.create_task(coroutine)
         self.run_task.add_done_callback(self.finish_run)
+        self.render_page()
 
     async def command_resume(self, args: list[str]) -> None:
         if len(args) != 1:
@@ -1294,44 +1378,72 @@ class BatchAgentTui(App[None]):
 
     async def command_harness(self, args: list[str]) -> None:
         if not args:
-            self.set_detail(
-                [
-                    f"Current harness: {self.harness_name}",
-                    "Available: " + ", ".join(available_harnesses()),
-                    "Use /harness doctor <name> before /harness use <name>.",
-                    "The selected harness is frozen into each new Run.",
-                ]
-            )
+            self.page = "harness"
+            self.render_page()
+            await self.refresh_harness_probes()
+            if self.page == "harness":
+                self.render_page()
             return
         action = args[0].lower()
-        if action in available_harnesses() and len(args) == 1:
-            action, args = "use", ["use", action]
+        if len(args) == 1:
+            try:
+                shorthand = canonical_harness_name(action)
+            except HarnessError:
+                pass
+            else:
+                action, args = "use", ["use", shorthand]
         if action == "reset":
             if len(args) != 1:
                 raise RuntimeError("Usage: /harness reset")
-            self.harness_name = "native"
-            self._save_preferences({"harness": "native"})
-            self.notify("harness reset to native")
-            self.render_page()
+            self.harness_probes["native"] = await probe_harness("native")
+            self.select_harness("native")
             return
         if action not in {"use", "doctor"} or len(args) != 2:
-            raise RuntimeError("Usage: /harness [use|doctor] <native|opencode|claude> | /harness reset")
-        name = args[1].lower()
-        if name not in available_harnesses():
-            raise RuntimeError(f"unknown harness: {name}")
+            raise RuntimeError(
+                "Usage: /harness [use|doctor] <built-in|opencode|claudecode|codex> | /harness reset"
+            )
+        name = canonical_harness_name(args[1])
         probe = await probe_harness(name)
+        self.harness_probes[name] = probe
+        self.page = "harness"
         if action == "doctor":
             severity = "information" if probe.available else "warning"
             self.notify(
-                f"{name}: {'available' if probe.available else 'unavailable'}: {probe.version or probe.error}",
+                f"{harness_display_name(name)}: "
+                f"{'available' if probe.available else 'unavailable'}: {probe.version or probe.error}",
                 severity=severity,
             )
+            self.render_page()
             return
         if not probe.available:
-            raise RuntimeError(f"harness {name} is unavailable: {probe.error}")
-        self.harness_name = name
-        self._save_preferences({"harness": name})
-        self.notify(f"harness set to {name}; applies to the next Run")
+            self.render_page()
+            raise RuntimeError(f"harness {harness_display_name(name)} is unavailable: {probe.error}")
+        self.select_harness(name)
+
+    async def refresh_harness_probes(self) -> None:
+        async def check(name: str) -> HarnessProbe:
+            try:
+                return await probe_harness(name)
+            except Exception as exc:
+                return HarnessProbe(name=name, available=False, error=str(exc))
+
+        names = [item["name"] for item in harness_catalog()]
+        probes = await asyncio.gather(*(check(name) for name in names))
+        self.harness_probes.update({probe.name: probe for probe in probes})
+
+    def select_harness(self, name: str) -> None:
+        canonical = canonical_harness_name(name)
+        probe = self.harness_probes.get(canonical)
+        if probe is None:
+            raise RuntimeError(f"check {harness_display_name(canonical)} availability before selecting it")
+        if not probe.available:
+            raise RuntimeError(
+                f"harness {harness_display_name(canonical)} is unavailable: {probe.error or 'probe failed'}"
+            )
+        self.harness_name = canonical
+        self._save_preferences({"harness": canonical})
+        self.page = "harness"
+        self.notify(f"harness set to {harness_display_name(canonical)}; applies to the next Run")
         self.render_page()
 
     def command_theme(self, args: list[str]) -> None:
@@ -1402,13 +1514,9 @@ class BatchAgentTui(App[None]):
                 index += 1
                 if index >= len(args):
                     raise RuntimeError("--harness requires a name")
-                harness = args[index].lower()
-                if harness not in available_harnesses():
-                    raise RuntimeError(f"unknown harness: {harness}")
+                harness = canonical_harness_name(args[index])
             elif arg.startswith("--harness="):
-                harness = arg.removeprefix("--harness=").lower()
-                if harness not in available_harnesses():
-                    raise RuntimeError(f"unknown harness: {harness}")
+                harness = canonical_harness_name(arg.removeprefix("--harness="))
             elif arg == "--resume":
                 index += 1
                 if index >= len(args):
@@ -1492,12 +1600,14 @@ class BatchAgentTui(App[None]):
             execution_error = exc
 
         notified = False
+        persisted_run_found = False
         if run_id:
             try:
                 run, tasks = self.persisted_run_snapshot(run_id)
             except RuntimeError:
                 pass
             else:
+                persisted_run_found = True
                 message, severity = _run_status_feedback(run, tasks)
                 if execution_error is not None and str(execution_error) not in message:
                     message = f"{message} Error: {execution_error}"
@@ -1515,6 +1625,9 @@ class BatchAgentTui(App[None]):
         self.pause_event = None
         self.active_run_id = ""
         self.active_manifest_path = None
+        if run_id and not persisted_run_found and self.selected_run_id == run_id:
+            self.selected_run_id = ""
+            self.page = "batch" if self.selected_manifest is not None else "home"
         self.refresh_current()
         if self.exit_after_pause:
             self.exit()
@@ -1671,7 +1784,7 @@ class BatchAgentTui(App[None]):
                         attempt_id=row["attempt_id"],
                         attempt_no=row["attempt_no"],
                         status=row["status"],
-                        harness=row["harness"],
+                        harness=harness_display_name(str(row["harness"])),
                         elapsed=_format_seconds(float(row.get("elapsed_seconds") or 0)),
                         tokens=row.get("total_tokens") if row.get("total_tokens") is not None else "-",
                     )
@@ -1688,7 +1801,8 @@ class BatchAgentTui(App[None]):
                     f"attempt_id: {selected_attempt}",
                     f"attempt_no: {chosen['attempt_no']}",
                     f"status: {chosen['status']}",
-                    f"harness: {chosen['harness']} {chosen.get('harness_version') or ''}",
+                    f"harness: {harness_display_name(str(chosen['harness']))} "
+                    f"{chosen.get('harness_version') or ''}",
                     f"external_session_id: {chosen.get('external_session_id') or ''}",
                     f"run_dir: {chosen['run_dir']}",
                     f"started_at: {chosen['started_at']}",

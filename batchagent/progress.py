@@ -48,6 +48,7 @@ class ProgressState:
     manifest: Manifest
     focus_task_id: str = ""
     work_id: str = ""
+    harness: str = ""
     started_monotonic: float = field(default_factory=time.monotonic)
     total_tasks: int = 0
     eligible_tasks: int = 0
@@ -78,6 +79,7 @@ class ProgressState:
         now = time.monotonic()
         if event_type == "batch_loaded":
             self.work_id = str(event.get("run_id") or event.get("work_id") or self.work_id)
+            self.harness = str(event.get("harness") or self.harness)
             self.total_tasks = int(event.get("total_tasks", self.total_tasks))
             self.eligible_tasks = int(event.get("eligible_tasks", self.eligible_tasks))
             self.concurrency = int(event.get("concurrency", self.concurrency))

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .agent import build_task_prompt
-from .harness import HarnessRequest, probe_harness, run_harness
+from .harness import HarnessRequest, canonical_harness_name, probe_harness, run_harness
 from .manifest import load_manifest, save_manifest
 from .models import AgentRunResult, ArtifactPolicy, BatchConfig, HarnessConfig, Manifest, RunVariable, Task
 from .paths import bagent_home, runs_dir, state_db_path as global_state_db_path
@@ -65,7 +65,7 @@ async def run_manifest(
                 record.get("config_snapshot"),
             )
             manifest.config.run_vars = dict(record.get("run_vars") or {})
-            selected_harness = harness or str(record.get("harness") or "native")
+            selected_harness = canonical_harness_name(harness or str(record.get("harness") or "native"))
             if harness is None:
                 # The Run record is the canonical harness identity. Preserve
                 # the rest of its frozen per-harness options from the snapshot.
@@ -1104,19 +1104,20 @@ def _raise_missing_task_ids(requested: set[str], known: set[str]) -> None:
 
 def _resolve_harness_name(manifest: Manifest, explicit: str | None) -> str:
     if explicit:
-        return explicit.strip().lower()
+        return canonical_harness_name(explicit)
     if "harness" in manifest.config.raw:
-        return (manifest.config.harness.name or "native").strip().lower()
+        return canonical_harness_name(manifest.config.harness.name or "native")
     try:
         configured = str(load_settings().get("harness") or "native")
     except SettingsError:
         configured = "native"
-    return configured.strip().lower() or "native"
+    return canonical_harness_name(configured.strip().lower() or "native")
 
 
 def _runtime_harness_config(manifest: Manifest, selected: str) -> HarnessConfig:
     current = manifest.config.harness
-    if current.name == selected:
+    if canonical_harness_name(current.name or "native") == selected:
+        current.name = selected
         return current
     return HarnessConfig(name=selected)
 
@@ -1336,9 +1337,10 @@ def validate_manifest(manifest: Manifest, *, harness_name: str | None = None) ->
     unknown = unknown_tool_names(manifest.config)
     if unknown:
         raise SchedulerError(f"unknown tools in manifest config: {', '.join(unknown)}")
+    selected_harness = canonical_harness_name(harness_name) if harness_name else _resolve_harness_name(manifest, None)
     if (
         manifest.config.artifact.require_submit
-        and (harness_name or _resolve_harness_name(manifest, None)) == "native"
+        and selected_harness == "native"
         and "submit_artifact" not in manifest.config.tools
     ):
         raise SchedulerError("native harness requires submit_artifact in tools when artifact.require_submit is true")

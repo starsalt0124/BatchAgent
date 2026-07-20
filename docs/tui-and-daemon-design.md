@@ -22,7 +22,7 @@ The current implementation is a single-process runner with a full-screen Textual
 - While a task is running, the detail field shows model deltas and tool activity.
 - When a task completes, the detail field switches to the artifact path or artifact record.
 - The hierarchy is Batch Config -> Run (`run_id`) -> Task (`task_id`) -> Attempt (`attempt_id`). Resume retains the Run id, retry appends an Attempt, and rerun creates another Run. Runtime data lives under `~/.bagent` by default.
-- `/harness` persists the default local runtime, and `/theme` plus Textual's theme picker persist color selection in `~/.bagent/settings.json`.
+- `/harness` opens a selectable availability table for built-in, OpenCode, Claude Code, and Codex. The chosen row has a text `CURRENT` marker, the sidebar repeats the choice on every page, and the setting persists in `~/.bagent/settings.json`. `/theme` plus Textual's theme picker persist color selection in the same file.
 - `--plain` and `--no-progress` remain available for logs and automation.
 
 This keeps execution deterministic: disabling the TUI does not change scheduling, tool calls, retries, artifact validation, or SQLite state transitions.

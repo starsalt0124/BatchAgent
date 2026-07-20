@@ -6,7 +6,13 @@ import json
 import sys
 from pathlib import Path
 
-from .harness import available_harnesses, probe_harness
+from .harness import (
+    HarnessError,
+    canonical_harness_name,
+    harness_display_name,
+    harness_display_names,
+    probe_harness,
+)
 from .manifest import ManifestError, create_sample_manifest, load_manifest
 from .provider import create_provider
 from .progress import PlainProgress, ProgressState
@@ -30,6 +36,13 @@ from .util import console_safe, truncate
 
 
 CLI_NAME = "bagent"
+
+
+def _harness_argument(value: str) -> str:
+    try:
+        return canonical_harness_name(value)
+    except HarnessError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -63,7 +76,13 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--no-progress", action="store_true", help="Disable progress output during execution.")
     run_parser.add_argument("--focus", default="", help="Focus one task in the TUI run page.")
     run_parser.add_argument("--var", action="append", default=None, help="Runtime template variable as name=value. Can be repeated.")
-    run_parser.add_argument("--harness", choices=available_harnesses(), default=None, help="Task harness for this new run.")
+    run_parser.add_argument(
+        "--harness",
+        type=_harness_argument,
+        default=None,
+        metavar="NAME",
+        help="Task harness for this new run: " + ", ".join(harness_display_names()) + ".",
+    )
 
     resume_parser = subparsers.add_parser("resume", help="Resume an incomplete persisted run using the same run id.")
     resume_parser.add_argument("manifest")
@@ -72,7 +91,13 @@ def main(argv: list[str] | None = None) -> int:
     resume_parser.add_argument("--retry-failed", action="store_true", help="Include failed tasks when resuming.")
     resume_parser.add_argument("--plain", action="store_true", help="Use non-interactive plain progress output.")
     resume_parser.add_argument("--no-progress", action="store_true", help="Disable progress output.")
-    resume_parser.add_argument("--harness", choices=available_harnesses(), default=None, help="Override the frozen harness explicitly.")
+    resume_parser.add_argument(
+        "--harness",
+        type=_harness_argument,
+        default=None,
+        metavar="NAME",
+        help="Override the frozen harness explicitly: " + ", ".join(harness_display_names()) + ".",
+    )
 
     runs_parser = subparsers.add_parser("runs", help="List persisted runs for a batch config.")
     runs_parser.add_argument("manifest")
@@ -122,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
 
     harness_parser = subparsers.add_parser("harness", help="Show, select, reset, or probe local task harnesses.")
     harness_parser.add_argument("action", nargs="?", choices=["show", "use", "reset", "doctor"], default="show")
-    harness_parser.add_argument("name", nargs="?", choices=available_harnesses())
+    harness_parser.add_argument("name", nargs="?", type=_harness_argument, metavar="NAME")
 
     skills_parser = subparsers.add_parser("skills", help="Install and list reusable agent skills.")
     skills_subparsers = skills_parser.add_subparsers(dest="skills_command", required=True)
@@ -489,14 +514,14 @@ def _runs(args) -> int:
 
 async def _harness_command(args) -> int:
     settings = load_settings()
-    current = str(settings.get("harness") or "native")
+    current = canonical_harness_name(str(settings.get("harness") or "native"))
     if args.action == "show":
-        print(f"current: {current}")
-        print("available: " + ", ".join(available_harnesses()))
+        print(f"current: {harness_display_name(current)}")
+        print("available: " + ", ".join(harness_display_names()))
         return 0
     if args.action == "reset":
         update_settings({"harness": "native"})
-        print("harness reset to native")
+        print("harness reset to built-in")
         return 0
     if not args.name:
         raise RuntimeError(f"harness {args.action} requires a harness name")
@@ -504,12 +529,12 @@ async def _harness_command(args) -> int:
     if args.action == "doctor":
         state = "available" if probe.available else "unavailable"
         detail = probe.version or probe.error or "(no detail)"
-        print(f"{probe.name}: {state}: {detail}")
+        print(f"{harness_display_name(probe.name)}: {state}: {detail}")
         return 0 if probe.available else 1
     if not probe.available:
         raise RuntimeError(f"harness {args.name} is unavailable: {probe.error}")
     update_settings({"harness": args.name})
-    print(f"harness set to {args.name} ({probe.version or probe.executable})")
+    print(f"harness set to {harness_display_name(args.name)} ({probe.version or probe.executable})")
     return 0
 
 

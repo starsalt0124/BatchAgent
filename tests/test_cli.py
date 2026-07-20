@@ -53,8 +53,10 @@ class CliTests(unittest.TestCase):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 self.assertEqual(main(["harness", "show"]), 0)
-            self.assertIn("current: native", output.getvalue())
+            self.assertIn("current: built-in", output.getvalue())
             self.assertIn("opencode", output.getvalue())
+            self.assertIn("claudecode", output.getvalue())
+            self.assertIn("codex", output.getvalue())
 
     def test_runs_command_lists_run_ids_not_attempt_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"BAGENT_HOME": str(Path(tmp) / "home")}):

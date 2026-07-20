@@ -1,6 +1,6 @@
 [project]
 name = "batchagent"
-version = "0.2.0"
+version = "0.3.0"
 description = "Markdown-driven batch agent harness for repeatable task lists."
 requires-python = ">=3.11"
 authors = [{ name = "BatchAgent" }]

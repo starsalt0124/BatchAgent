@@ -271,6 +271,7 @@ class SessionStoreTests(unittest.TestCase):
                 store.start_attempt("attempt-stream", "run-stream", "task-a", 1, root / "attempt")
                 store.update_attempt_usage("attempt-stream", {"tokens": {"input_tokens": 5}})
                 store.update_attempt_usage("attempt-stream", {"tokens": {"output_tokens": 2}})
+                store.update_attempt_usage("attempt-stream", {"cached_input_tokens": 3})
 
                 attempt = store.attempt("attempt-stream")
                 self.assertEqual(
@@ -278,6 +279,7 @@ class SessionStoreTests(unittest.TestCase):
                     {"input_tokens": 5, "output_tokens": 2},
                 )
                 self.assertEqual(attempt["total_tokens"], 7)  # type: ignore[index]
+                self.assertEqual(attempt["cached_tokens"], 3)  # type: ignore[index]
                 self.assertEqual(store.run_task("run-stream", "task-a")["total_tokens"], 7)  # type: ignore[index]
                 self.assertEqual(store.batch_run("run-stream")["total_tokens"], 7)  # type: ignore[index]
             finally:

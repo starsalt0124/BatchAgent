@@ -59,7 +59,7 @@ require_artifact_path = true
 required_metadata_keys = ["task_id", "status"]
 ```
 
-`tools` is explicit for the native harness. If omitted or empty, no native tools are loaded. With `require_submit = true`, native execution must include `submit_artifact`; OpenCode/Claude receive it through the injected MCP server.
+`tools` is explicit for the built-in (`native`) harness. If omitted or empty, no built-in tools are loaded. With `require_submit = true`, built-in execution must include `submit_artifact`; OpenCode, Claude Code, and Codex receive it through the injected MCP server.
 
 Prompt templates support `CURR_DATE` and `{{CURR_DATE}}`; both are replaced when a task is dispatched with the current local date in `YYYY-MM-DD` format. Use it for date-sensitive research and status reports.
 

@@ -118,7 +118,9 @@ class _StreamState:
 
 class HarnessAdapter:
     name = ""
+    display_name = ""
     executable = ""
+    description = ""
     capabilities = HarnessCapabilities(False, False, False, False)
 
     def command_prefix(self, config: HarnessConfig) -> list[str]:
@@ -202,7 +204,9 @@ class HarnessAdapter:
 
 class NativeHarness(HarnessAdapter):
     name = "native"
+    display_name = "built-in"
     executable = sys.executable
+    description = "BatchAgent's built-in OpenAI-compatible agent loop."
     capabilities = HarnessCapabilities(True, False, False, False)
 
     async def probe(self, config: HarnessConfig | None = None, *, timeout_seconds: float = 5.0) -> HarnessProbe:
@@ -249,7 +253,9 @@ class NativeHarness(HarnessAdapter):
 
 class OpenCodeHarness(HarnessAdapter):
     name = "opencode"
+    display_name = "opencode"
     executable = "opencode"
+    description = "Local OpenCode CLI with run-scoped bagent MCP tools."
     capabilities = HarnessCapabilities(True, True, True, True)
 
     async def build_invocation(self, request: HarnessRequest) -> HarnessInvocation:
@@ -297,7 +303,9 @@ class OpenCodeHarness(HarnessAdapter):
 
 class ClaudeCodeHarness(HarnessAdapter):
     name = "claude"
+    display_name = "claudecode"
     executable = "claude"
+    description = "Local Claude Code CLI with run-scoped bagent MCP tools."
     capabilities = HarnessCapabilities(True, True, True, True)
 
     async def build_invocation(self, request: HarnessRequest) -> HarnessInvocation:
@@ -350,6 +358,58 @@ class ClaudeCodeHarness(HarnessAdapter):
         )
 
 
+class CodexHarness(HarnessAdapter):
+    name = "codex"
+    display_name = "codex"
+    executable = "codex"
+    description = "Local Codex CLI in workspace-write sandbox mode with bagent MCP tools."
+    capabilities = HarnessCapabilities(True, True, True, True)
+
+    async def build_invocation(self, request: HarnessRequest) -> HarnessInvocation:
+        runtime = request.runtime_config
+        _require_completion_transport(request)
+        prefix = self.command_prefix(runtime)
+        _validate_harness_command(self.name, prefix, runtime.extra_args)
+        command = [
+            *prefix,
+            "exec",
+            "--json",
+            "--color",
+            "never",
+            "--sandbox",
+            "workspace-write",
+            "--skip-git-repo-check",
+            "-C",
+            str(request.workspace),
+        ]
+        if runtime.inject_tools:
+            mcp_command = _mcp_command()
+            command.extend(
+                [
+                    "-c",
+                    f"mcp_servers.bagent.command={_toml_string(mcp_command[0])}",
+                    "-c",
+                    f"mcp_servers.bagent.args={_toml_string(mcp_command[1:])}",
+                    "-c",
+                    f"mcp_servers.bagent.env={_toml_inline_table(_mcp_environment(request))}",
+                    "-c",
+                    'mcp_servers.bagent.enabled_tools=["submit_artifact","report_progress"]',
+                ]
+            )
+        if runtime.model:
+            command.extend(["--model", runtime.model])
+        if runtime.agent:
+            command.extend(["--profile", runtime.agent])
+        command.extend(runtime.extra_args)
+        command.append("-")
+        return HarnessInvocation(
+            command=tuple(command),
+            cwd=request.workspace,
+            env=_request_environment(request),
+            prompt=_external_prompt(request),
+        )
+
+
 class HarnessRegistry:
     def __init__(self) -> None:
         self._adapters: dict[str, HarnessAdapter] = {}
@@ -365,15 +425,24 @@ class HarnessRegistry:
             self._aliases[alias.strip().lower()] = name
 
     def get(self, name: str) -> HarnessAdapter:
-        normalized = name.strip().lower()
-        canonical = self._aliases.get(normalized, normalized)
+        canonical = self.canonical_name(name)
         try:
             return self._adapters[canonical]
         except KeyError as exc:
             raise HarnessError(f"unknown harness: {name}; available: {', '.join(self.names())}") from exc
 
     def names(self) -> list[str]:
-        return sorted(self._adapters)
+        return list(self._adapters)
+
+    def canonical_name(self, name: str) -> str:
+        normalized = name.strip().lower()
+        canonical = self._aliases.get(normalized, normalized)
+        if canonical not in self._adapters:
+            raise HarnessError(f"unknown harness: {name}; available: {', '.join(self.display_names())}")
+        return canonical
+
+    def display_names(self) -> list[str]:
+        return [self._adapters[name].display_name or name for name in self.names()]
 
     async def probe(self, name: str, config: HarnessConfig | None = None) -> HarnessProbe:
         return await self.get(name).probe(config)
@@ -382,7 +451,8 @@ class HarnessRegistry:
 DEFAULT_HARNESS_REGISTRY = HarnessRegistry()
 DEFAULT_HARNESS_REGISTRY.register(NativeHarness(), "builtin", "built-in")
 DEFAULT_HARNESS_REGISTRY.register(OpenCodeHarness(), "open-code")
-DEFAULT_HARNESS_REGISTRY.register(ClaudeCodeHarness(), "claude-code", "claude_code")
+DEFAULT_HARNESS_REGISTRY.register(ClaudeCodeHarness(), "claudecode", "claude-code", "claude_code")
+DEFAULT_HARNESS_REGISTRY.register(CodexHarness(), "codex-cli")
 
 
 def get_harness(name: str) -> HarnessAdapter:
@@ -391,6 +461,34 @@ def get_harness(name: str) -> HarnessAdapter:
 
 def available_harnesses() -> list[str]:
     return DEFAULT_HARNESS_REGISTRY.names()
+
+
+def canonical_harness_name(name: str) -> str:
+    return DEFAULT_HARNESS_REGISTRY.canonical_name(name)
+
+
+def harness_display_name(name: str) -> str:
+    try:
+        adapter = get_harness(name)
+    except HarnessError:
+        return name.strip() or "unknown"
+    return adapter.display_name or adapter.name
+
+
+def harness_display_names() -> list[str]:
+    return DEFAULT_HARNESS_REGISTRY.display_names()
+
+
+def harness_catalog() -> list[dict[str, str]]:
+    return [
+        {
+            "name": name,
+            "display_name": harness_display_name(name),
+            "executable": get_harness(name).executable,
+            "description": get_harness(name).description,
+        }
+        for name in available_harnesses()
+    ]
 
 
 async def probe_harness(name: str, config: HarnessConfig | None = None) -> HarnessProbe:
@@ -617,7 +715,7 @@ def _handle_json_event(
     if event_type.lower() == "result" and "result" in payload:
         state.output = payload.get("result")
 
-    session_id = _find_string(payload, {"session_id", "sessionid"})
+    session_id = _find_string(payload, {"session_id", "sessionid", "thread_id", "threadid"})
     if session_id and session_id != state.session_id:
         state.session_id = session_id
         _emit(request, {"type": "harness_session", "harness": harness_name, "session_id": session_id})
@@ -660,6 +758,10 @@ def _extract_text(payload: dict[str, Any]) -> str:
             text = _content_text(payload.get(key))
             if text:
                 return text
+    if event_type in {"item.started", "item.updated", "item.completed"}:
+        text = _content_text(payload.get("item"))
+        if text:
+            return text
     part = payload.get("part")
     if isinstance(part, dict) and str(part.get("type") or "").lower() in {"text", "reasoning"}:
         return str(part.get("text") or "")
@@ -699,10 +801,17 @@ def _extract_tool_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
     part = payload.get("part")
     if isinstance(part, dict):
         blocks.append(part)
+    item = payload.get("item")
+    if isinstance(item, dict):
+        blocks.append(item)
     for block in blocks:
         kind = str(block.get("type") or "").lower()
         name = str(block.get("name") or block.get("tool") or "")
-        if kind in {"tool_use", "tool", "tool-call"} and name:
+        if kind == "mcp_tool_call" and block.get("server"):
+            name = f"{block['server']}.{name or 'tool'}"
+        if kind in {"command_execution", "file_change"} and not name:
+            name = kind
+        if kind in {"tool_use", "tool", "tool-call", "mcp_tool_call", "command_execution", "file_change"} and name:
             state = block.get("state") or {}
             status = str(state.get("status") or block.get("status") or "").lower() if isinstance(state, dict) else ""
             if status in {"completed", "done", "error", "failed"}:
@@ -710,9 +819,13 @@ def _extract_tool_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     {
                         "type": "tool_finished",
                         "tool": name,
-                        "arguments": block.get("input") or block.get("arguments") or {},
-                        "error": str(state.get("error") or "") if isinstance(state, dict) else "",
-                        "result": state.get("output") if isinstance(state, dict) else None,
+                        "arguments": block.get("input") or block.get("arguments") or {"command": block.get("command")},
+                        "error": str(
+                            (state.get("error") if isinstance(state, dict) else "") or block.get("error") or ""
+                        ),
+                        "result": (
+                            state.get("output") if isinstance(state, dict) else None
+                        ) or block.get("result") or block.get("aggregated_output"),
                     }
                 )
             else:
@@ -720,7 +833,7 @@ def _extract_tool_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     {
                         "type": "tool_started",
                         "tool": name,
-                        "arguments": block.get("input") or block.get("arguments") or {},
+                        "arguments": block.get("input") or block.get("arguments") or {"command": block.get("command")},
                     }
                 )
     return events
@@ -814,6 +927,16 @@ def _mcp_command() -> list[str]:
     return [sys.executable, "-m", "batchagent.harness_mcp"]
 
 
+def _toml_string(value: Any) -> str:
+    """Return a JSON spelling, which is valid for TOML strings and arrays."""
+
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _toml_inline_table(values: Mapping[str, str]) -> str:
+    return "{" + ",".join(f"{key}={_toml_string(value)}" for key, value in values.items()) + "}"
+
+
 def _request_environment(request: HarnessRequest) -> dict[str, str]:
     if request.environment is not None:
         return {str(key): str(value) for key, value in request.environment.items()}
@@ -834,6 +957,7 @@ def _minimal_environment(allowlist: list[str]) -> dict[str, str]:
         "TMPDIR",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
+        "CODEX_HOME",
         "APPDATA",
         "LOCALAPPDATA",
         "LANG",
@@ -909,6 +1033,17 @@ def _reject_unsafe_extra_args(name: str, args: list[str]) -> None:
         or any(arg.startswith("--permission-mode=bypasspermissions") for arg in lowered)
     ):
         raise HarnessError("bagent does not allow Claude permission bypass flags in unattended task execution")
+    if name == "codex" and any(
+        marker in arg
+        for arg in lowered
+        for marker in (
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust",
+            "danger-full-access",
+            "disk-full-read-access",
+        )
+    ):
+        raise HarnessError("bagent does not allow Codex sandbox or approval bypass flags in unattended task execution")
 
 
 def _merge_usage(target: dict[str, Any], incoming: Mapping[str, Any]) -> None:
