@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from .models import BatchConfig
+from .paths import skill_search_dirs
 from .util import safe_join
 
 
@@ -58,7 +59,9 @@ def resolve_workspace_path(
 def review_command(config: BatchConfig, workspace: Path, run_dir: Path, command: list[str]) -> None:
     if not command:
         raise SecurityError("command must not be empty")
-    if not _is_allowed_command(config, command):
+    if config.command_policy not in {"allowlist", "blacklist"}:
+        raise SecurityError(f"invalid command_policy: {config.command_policy}")
+    if config.command_policy == "allowlist" and not _is_allowed_command(config, command):
         raise SecurityError(f"command is not allowlisted: {command}")
 
     command_text = " ".join(command)
@@ -67,7 +70,7 @@ def review_command(config: BatchConfig, workspace: Path, run_dir: Path, command:
             raise SecurityError(f"command rejected by safety policy: {pattern}")
 
     executable = Path(command[0]).name.lower()
-    if executable in WRITE_VERBS:
+    if config.command_policy == "allowlist" and executable in WRITE_VERBS:
         raise SecurityError(f"command rejected because it can modify files: {executable}")
 
     for token in command[1:]:
@@ -119,11 +122,14 @@ def _reject_external_absolute_path_token(token: str, workspace: Path, run_dir: P
         resolved = path.resolve(strict=False)
     except OSError:
         raise SecurityError(f"absolute command argument is invalid: {token}") from None
-    allowed_roots = [workspace.resolve(), run_dir.resolve()]
+    allowed_roots = [workspace.resolve(), run_dir.resolve(), *_skill_command_roots()]
     if not any(resolved == root or resolved.is_relative_to(root) for root in allowed_roots):
-        raise SecurityError(f"absolute command argument escapes workspace/run_dir: {token}")
+        raise SecurityError(f"absolute command argument escapes workspace/run_dir/skill roots: {token}")
 
 
 def _looks_like_url(value: str) -> bool:
     return value.startswith("http://") or value.startswith("https://")
 
+
+def _skill_command_roots() -> list[Path]:
+    return [root.resolve() for root in skill_search_dirs() if root.exists()]

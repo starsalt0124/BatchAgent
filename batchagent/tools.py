@@ -198,7 +198,7 @@ def _delete_file(ctx: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
     path = resolve_workspace_path(ctx.workspace, str(arguments["path"]), ctx.config, action="write", must_exist=True)
     resolved = path.resolve()
     if resolved not in ctx.created_paths:
-        raise ToolError("delete_file may only delete files created by this task run")
+        raise ToolError("delete_file may only delete files created by this Task Attempt")
     if not path.is_file():
         raise ToolError("delete_file only deletes files, not directories")
     path.unlink()
@@ -424,7 +424,7 @@ ALL_TOOLS: dict[str, ToolDefinition] = {
     "delete_file": ToolDefinition(
         _spec(
             "delete_file",
-            "Delete a file only if this task run created it with write_file. Directories and existing files are blocked.",
+            "Delete a file only if this Task Attempt created it with write_file. Directories and existing files are blocked.",
             {"path": {"type": "string"}},
             ["path"],
         ),

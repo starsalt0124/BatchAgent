@@ -6,7 +6,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from .models import ArtifactPolicy, BatchConfig, Manifest, RunVariable, Task
+from .models import ArtifactPolicy, BatchConfig, HarnessConfig, Manifest, RunVariable, Task
 from .util import atomic_write_text
 
 
@@ -47,6 +47,13 @@ def save_manifest(manifest: Manifest) -> None:
     manifest.tasks_end = manifest.tasks_start + len(TASKS_START) + 1 + len(table) + 1
 
 
+def _task_input_table_json(value: dict[str, Any]) -> str:
+    # Use JSON unicode escapes for pipes so Markdown table parsing cannot split
+    # task input cells. This is less ambiguous than backslash-escaping when the
+    # original JSON string already contains shell regexes such as "\\|".
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace("|", "\\u007c")
+
+
 def render_tasks_table(tasks: list[Task]) -> str:
     lines = [
         "| " + " | ".join(STANDARD_COLUMNS) + " |",
@@ -57,7 +64,7 @@ def render_tasks_table(tasks: list[Task]) -> str:
             "status": task.status,
             "id": task.id,
             "kind": task.kind,
-            "input": json.dumps(task.input, ensure_ascii=False, separators=(",", ":")) if task.input else "",
+            "input": _task_input_table_json(task.input) if task.input else "",
             "result": task.result,
             "attempts": str(task.attempts),
             "updated": task.updated,
@@ -79,7 +86,7 @@ version = 1
 name = "demo"
 workspace = "."
 workspace_mode = "shared"
-run_dir = ".batchagent/runs"
+run_dir = "~/.bagent/runs"
 parallel = true
 max_concurrency = 2
 retries = 1
@@ -134,13 +141,14 @@ def _parse_config(text: str) -> BatchConfig:
         validator_command=list(artifact_raw.get("validator_command", [])),
         validator_timeout_seconds=int(artifact_raw.get("validator_timeout_seconds", 120)),
     )
+    harness = _parse_harness_config(raw.get("harness", {}))
     return BatchConfig(
         version=int(raw.get("version", 1)),
         name=str(raw.get("name", "batchagent")),
         workspace=str(raw.get("workspace", ".")),
         workspace_mode=str(raw.get("workspace_mode", "shared")),
-        copy_exclude=list(raw.get("copy_exclude", [".git", ".batchagent", "__pycache__"])),
-        run_dir=str(raw.get("run_dir", ".batchagent/runs")),
+        copy_exclude=list(raw.get("copy_exclude", [".git", ".batchagent", ".bagent", "__pycache__"])),
+        run_dir=str(raw.get("run_dir", "~/.bagent/runs")),
         parallel=bool(raw.get("parallel", False)),
         max_concurrency=int(raw.get("max_concurrency", 1)),
         retries=int(raw.get("retries", 0)),
@@ -154,13 +162,19 @@ def _parse_config(text: str) -> BatchConfig:
         max_tokens=int(raw["max_tokens"]) if "max_tokens" in raw else None,
         request_timeout_seconds=int(raw.get("request_timeout_seconds", 120)),
         provider_retries=int(raw.get("provider_retries", 2)),
+        dialog_recovery_attempts=int(raw.get("dialog_recovery_attempts", 5)),
         reasoning_effort=str(raw.get("reasoning_effort", "")),
         thinking=str(raw.get("thinking", "")),
         system_prompt=str(raw.get("system_prompt", "")),
         user_prompt_template=str(raw.get("user_prompt_template", "")),
         run_variables=_parse_run_variables(raw.get("run_variables", [])),
         memory_files=list(raw.get("memory_files", [])),
+        skills=list(raw.get("skills", [])),
+        skill_roots=list(raw.get("skill_roots", [])),
+        task_selector_script=str(raw.get("task_selector_script", "")),
+        task_selector_command=[str(item) for item in raw.get("task_selector_command", [])],
         tools=list(raw.get("tools", [])),
+        command_policy=str(raw.get("command_policy", "allowlist")).strip().lower() or "allowlist",
         allowed_command_prefixes=[_command_prefix(prefix) for prefix in raw.get("allowed_command_prefixes", [])],
         blocked_command_patterns=list(raw.get("blocked_command_patterns", [])),
         blocked_path_patterns=list(
@@ -172,8 +186,43 @@ def _parse_config(text: str) -> BatchConfig:
         command_clean_env=bool(raw.get("command_clean_env", True)),
         web_timeout_seconds=int(raw.get("web_timeout_seconds", 15)),
         web_max_chars=int(raw.get("web_max_chars", 20000)),
+        harness=harness,
         artifact=artifact,
         raw=raw,
+    )
+
+
+def _parse_harness_config(value: Any) -> HarnessConfig:
+    if isinstance(value, str):
+        return HarnessConfig(name=value.strip().lower() or "native")
+    if value is None:
+        return HarnessConfig()
+    if not isinstance(value, dict):
+        raise ManifestError("harness must be a string or TOML table")
+
+    command_raw = value.get("command", [])
+    if isinstance(command_raw, str):
+        command = [command_raw] if command_raw else []
+    elif isinstance(command_raw, list):
+        command = [str(item) for item in command_raw]
+    else:
+        raise ManifestError("harness.command must be a string or list of strings")
+
+    extra_args_raw = value.get("extra_args", value.get("args", []))
+    if not isinstance(extra_args_raw, list):
+        raise ManifestError("harness.extra_args must be a list of strings")
+    env_allowlist_raw = value.get("env_allowlist", [])
+    if not isinstance(env_allowlist_raw, list):
+        raise ManifestError("harness.env_allowlist must be a list of environment variable names")
+
+    return HarnessConfig(
+        name=str(value.get("name", "native")).strip().lower() or "native",
+        command=command,
+        extra_args=[str(item) for item in extra_args_raw],
+        model=str(value.get("model", "")),
+        agent=str(value.get("agent", "")),
+        inject_tools=bool(value.get("inject_tools", True)),
+        env_allowlist=[str(item) for item in env_allowlist_raw],
     )
 
 

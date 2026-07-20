@@ -1,17 +1,11 @@
 from __future__ import annotations
 
-import asyncio
-import os
-import select
-import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any, Awaitable
+from typing import Any
 
-from .models import Manifest, Task
-from .util import console_safe, truncate
+from .models import Manifest
+from .util import truncate
 
 
 TERMINAL = {"done", "failed", "skipped"}
@@ -25,11 +19,13 @@ class TaskProgress:
     result: str = ""
     error: str = ""
     run_id: str = ""
+    attempt_id: str = ""
     run_dir: str = ""
     artifact_path: str = ""
     detail: str = ""
     stream_text: str = ""
     events: list[str] = field(default_factory=list)
+    total_tokens: int | None = None
     started_monotonic: float | None = None
     finished_monotonic: float | None = None
     current_run_started_monotonic: float | None = None
@@ -58,7 +54,8 @@ class ProgressState:
     concurrency: int = 1
     tasks: dict[str, TaskProgress] = field(default_factory=dict)
     current_run_task_ids: set[str] = field(default_factory=set)
-    view_mode: str = "overview"
+    paused: bool = False
+    pause_detail: str = ""
 
     @classmethod
     def from_manifest(cls, manifest: Manifest, focus_task_id: str = "") -> "ProgressState":
@@ -80,15 +77,25 @@ class ProgressState:
         event_type = event.get("type")
         now = time.monotonic()
         if event_type == "batch_loaded":
-            self.work_id = str(event.get("work_id") or self.work_id)
+            self.work_id = str(event.get("run_id") or event.get("work_id") or self.work_id)
             self.total_tasks = int(event.get("total_tasks", self.total_tasks))
             self.eligible_tasks = int(event.get("eligible_tasks", self.eligible_tasks))
             self.concurrency = int(event.get("concurrency", self.concurrency))
+            self.paused = False
+            self.pause_detail = ""
             return
+        if event_type == "batch_paused":
+            self.paused = True
+            pending = int(event.get("pending_tasks") or 0)
+            running = int(event.get("running_tasks") or 0)
+            self.pause_detail = f"paused with {pending} pending task(s), {running} running task(s)"
+            return
+
         task_id = str(event.get("task_id") or "")
         if not task_id:
             return
         task = self.tasks.setdefault(task_id, TaskProgress(id=task_id, status="unknown"))
+
         if event_type == "task_queued":
             self.current_run_task_ids.add(task_id)
             task.status = "queued"
@@ -97,7 +104,8 @@ class ProgressState:
         if event_type == "task_started":
             self.current_run_task_ids.add(task_id)
             task.status = "running"
-            task.run_id = str(event.get("run_id") or "")
+            task.run_id = str(event.get("run_id") or self.work_id)
+            task.attempt_id = str(event.get("attempt_id") or "")
             task.run_dir = str(event.get("run_dir") or "")
             task.attempts = int(event.get("attempt", task.attempts))
             if task.started_monotonic is None:
@@ -106,6 +114,37 @@ class ProgressState:
             task.finished_monotonic = None
             task.error = ""
             task.detail = "model starting"
+            return
+        if event_type in {"harness_progress", "harness_stderr"}:
+            text = str(event.get("message") or event.get("content") or "")
+            if text:
+                task.detail = truncate(text, 160)
+                task.events.append(task.detail)
+                task.events = task.events[-30:]
+            return
+        if event_type == "harness_usage":
+            usage = event.get("usage") or {}
+            if isinstance(usage, dict):
+                total = usage.get("total_tokens")
+                tokens = usage.get("tokens") if isinstance(usage.get("tokens"), dict) else {}
+                if total is None:
+                    total = tokens.get("total") or tokens.get("total_tokens")
+                if total is None:
+                    prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+                    completion = usage.get("completion_tokens", usage.get("output_tokens"))
+                    if prompt is None:
+                        prompt = tokens.get("prompt_tokens", tokens.get("input_tokens"))
+                    if completion is None:
+                        completion = tokens.get("completion_tokens", tokens.get("output_tokens"))
+                    if prompt is not None or completion is not None:
+                        try:
+                            total = int(prompt or 0) + int(completion or 0)
+                        except (TypeError, ValueError):
+                            total = None
+                try:
+                    task.total_tokens = int(total) if total is not None else task.total_tokens
+                except (TypeError, ValueError):
+                    pass
             return
         if event_type == "model_delta":
             delta = str(event.get("delta") or "")
@@ -201,7 +240,7 @@ class PlainProgress:
         event_type = event.get("type")
         if event_type == "batch_loaded":
             print(
-                f"batch work {event.get('work_id') or '(unknown)'} loaded {event.get('total_tasks', 0)} task(s), "
+                f"run {event.get('run_id') or event.get('work_id') or '(unknown)'} loaded {event.get('total_tasks', 0)} task(s), "
                 f"selected {event.get('eligible_tasks', 0)}, concurrency {event.get('concurrency', 1)}"
             )
         elif event_type == "task_started":
@@ -212,158 +251,11 @@ class PlainProgress:
             print(f"retry {event.get('task_id')}: {event.get('error')}")
         elif event_type == "task_failed":
             print(f"failed {event.get('task_id')}: {event.get('error')}")
-
-
-class RichRunDisplay:
-    def __init__(self, state: ProgressState):
-        self.state = state
-        self._rich = _load_rich()
-
-    @property
-    def available(self) -> bool:
-        return self._rich is not None
-
-    async def run(self, awaitable: Awaitable[list[Any]]) -> list[Any]:
-        if self._rich is None:
-            return await awaitable
-        Live = self._rich["Live"]
-        console = self._rich["Console"]()
-        with KeyPoller() as keys, Live(self.render(), console=console, refresh_per_second=4, transient=False, screen=True) as live:
-            task = asyncio.create_task(awaitable)
-            while not task.done():
-                self._handle_key(keys.get_key())
-                live.update(self.render())
-                await asyncio.sleep(0.25)
-            result = await task
-            live.update(self.render(final=True))
-            await asyncio.sleep(0.5)
-            return result
-
-    def render(self, final: bool = False) -> Any:
-        if self._rich is None:
-            return ""
-        Group = self._rich["Group"]
-        Panel = self._rich["Panel"]
-        Table = self._rich["Table"]
-        Text = self._rich["Text"]
-        ProgressBar = self._rich["ProgressBar"]
-
-        counts = self.state.counts()
-        done = counts.get("done", 0)
-        failed = counts.get("failed", 0)
-        running = counts.get("running", 0)
-        retry = counts.get("retry", 0)
-        queued = counts.get("queued", 0)
-        complete = done + failed + counts.get("skipped", 0)
-        total = max(1, self.state.total_tasks)
-        eta = self.state.eta_seconds()
-        eta_text = "unknown" if eta is None else _format_seconds(eta)
-        finish_text = "unknown" if eta is None else (datetime.now() + timedelta(seconds=eta)).strftime("%H:%M:%S")
-        title = "BatchAgent Run" + (" (final)" if final else "")
-
-        header = Table.grid(expand=True)
-        header.add_column(ratio=1)
-        header.add_row(
-            Text(
-                f"work {self.state.work_id or '(pending)'} | loaded {self.state.total_tasks} | selected {self.state.eligible_tasks} | "
-                f"running {running} | queued {queued} | done {done} | failed {failed} | retry {retry}"
+        elif event_type == "batch_paused":
+            print(
+                f"paused {event.get('run_id') or event.get('work_id') or '(unknown)'}: "
+                f"{event.get('pending_tasks', 0)} pending task(s), {event.get('running_tasks', 0)} running"
             )
-        )
-        header.add_row(ProgressBar(total=total, completed=complete, width=None))
-        header.add_row(Text(f"elapsed {_format_seconds(self.state.elapsed())} | ETA {eta_text} | estimated finish {finish_text}"))
-
-        task_table = Table(expand=True)
-        task_table.add_column("Status", width=9)
-        task_table.add_column("Task", ratio=2, overflow="fold")
-        task_table.add_column("Attempts", justify="right", width=8)
-        task_table.add_column("Run Time", justify="right", width=10)
-        task_table.add_column("Detail", ratio=3, overflow="fold")
-        now = time.monotonic()
-        for task in self._ordered_tasks():
-            status_style = _status_style(task.status)
-            detail = task.error or task.result or task.run_dir
-            if task.id == self.state.focus_task_id:
-                detail = "[focus] " + detail
-            task_table.add_row(
-                Text(task.status, style=status_style),
-                console_safe(task.id),
-                str(task.attempts),
-                _format_seconds(task.elapsed_current(now)),
-                console_safe(truncate(detail, 90)),
-            )
-
-        focused = self._focused_panel()
-        help_text = "Keys: ↑/↓ focus task | Enter detail page | Esc overview"
-        panels = [Panel(header, title=title), Panel(help_text, title="Controls")]
-        if self.state.view_mode == "task":
-            focused = self._focused_panel(full=True)
-            if focused is not None:
-                panels.append(focused)
-            else:
-                panels.append(Panel(task_table, title="Tasks"))
-            return Group(*panels)
-        panels.append(Panel(task_table, title="Tasks"))
-        if focused is not None:
-            panels.append(focused)
-        return Group(*panels)
-
-    def _ordered_tasks(self) -> list[TaskProgress]:
-        return self.state.ordered_tasks()
-
-    def _focused_panel(self, full: bool = False) -> Any | None:
-        if not self.state.focus_task_id or self._rich is None:
-            return None
-        Panel = self._rich["Panel"]
-        task = self.state.tasks.get(self.state.focus_task_id)
-        if task is None:
-            return Panel(f"Task not found: {self.state.focus_task_id}", title="Focus")
-        detail = "\n".join(
-            [
-                f"id: {task.id}",
-                f"status: {task.status}",
-                f"attempts: {task.attempts}",
-                f"run_dir: {console_safe(task.run_dir)}",
-                f"result: {console_safe(task.result)}",
-                f"artifact: {console_safe(task.artifact_path)}",
-                f"error: {console_safe(task.error)}",
-            ]
-        )
-        if full:
-            stream = console_safe(_tail_lines(task.stream_text, max(10, _terminal_height() - 20)))
-            events = console_safe("\n".join(task.events[-8:]))
-            detail = detail + "\n\nRecent tool/model events:\n" + events + "\n\nModel output tail:\n" + stream
-        return Panel(detail, title="Task Detail" if full else "Focus")
-
-    def _handle_key(self, key: str | None) -> None:
-        if key == "up":
-            self.state.move_focus(-1)
-        elif key == "down":
-            self.state.move_focus(1)
-        elif key == "enter":
-            self.state.view_mode = "task"
-        elif key == "esc":
-            self.state.view_mode = "overview"
-
-
-def _load_rich() -> dict[str, Any] | None:
-    try:
-        from rich.console import Console, Group
-        from rich.live import Live
-        from rich.panel import Panel
-        from rich.progress_bar import ProgressBar
-        from rich.table import Table
-        from rich.text import Text
-    except ImportError:
-        return None
-    return {
-        "Console": Console,
-        "Group": Group,
-        "Live": Live,
-        "Panel": Panel,
-        "ProgressBar": ProgressBar,
-        "Table": Table,
-        "Text": Text,
-    }
 
 
 def _format_seconds(seconds: float) -> str:
@@ -377,88 +269,8 @@ def _format_seconds(seconds: float) -> str:
     return f"{sec}s"
 
 
-def _status_style(status: str) -> str:
-    return {
-        "running": "bold cyan",
-        "queued": "blue",
-        "done": "green",
-        "failed": "bold red",
-        "retry": "yellow",
-        "todo": "dim",
-        "skipped": "magenta",
-    }.get(status, "")
-
-
-class KeyPoller:
-    def __init__(self) -> None:
-        self._old_term = None
-
-    def __enter__(self) -> "KeyPoller":
-        if os.name != "nt" and sys.stdin.isatty():
-            try:
-                import termios
-                import tty
-
-                self._old_term = termios.tcgetattr(sys.stdin)
-                tty.setcbreak(sys.stdin.fileno())
-            except Exception:
-                self._old_term = None
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if self._old_term is not None:
-            try:
-                import termios
-
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_term)
-            except Exception:
-                pass
-
-    def get_key(self) -> str | None:
-        if not sys.stdin.isatty():
-            return None
-        if os.name == "nt":
-            try:
-                import msvcrt
-
-                if not msvcrt.kbhit():
-                    return None
-                ch = msvcrt.getwch()
-                if ch in {"\x00", "\xe0"}:
-                    code = msvcrt.getwch()
-                    return {"H": "up", "P": "down"}.get(code)
-                if ch == "\r":
-                    return "enter"
-                if ch == "\x1b":
-                    return "esc"
-            except Exception:
-                return None
-        else:
-            try:
-                readable, _, _ = select.select([sys.stdin], [], [], 0)
-                if not readable:
-                    return None
-                ch = sys.stdin.read(1)
-                if ch == "\n":
-                    return "enter"
-                if ch == "\x1b":
-                    readable, _, _ = select.select([sys.stdin], [], [], 0)
-                    if not readable:
-                        return "esc"
-                    seq = ch + sys.stdin.read(2)
-                    return {"\x1b[A": "up", "\x1b[B": "down"}.get(seq)
-            except Exception:
-                return None
-        return None
-
-
 def _tail_text(value: str, limit: int) -> str:
     return value[-limit:] if len(value) > limit else value
-
-
-def _tail_lines(value: str, max_lines: int) -> str:
-    lines = value.splitlines()
-    return "\n".join(lines[-max_lines:])
 
 
 def _last_nonempty_line(value: str) -> str:
@@ -466,10 +278,3 @@ def _last_nonempty_line(value: str) -> str:
         if line.strip():
             return truncate(line.strip(), 120)
     return ""
-
-
-def _terminal_height() -> int:
-    try:
-        return os.get_terminal_size().lines
-    except OSError:
-        return 30

@@ -26,7 +26,7 @@ version = 1
 name = "batch-name"
 workspace = "."
 workspace_mode = "copy"
-run_dir = ".batchagent/runs"
+run_dir = "~/.bagent/runs"
 parallel = true
 max_concurrency = 4
 retries = 1
@@ -39,7 +39,7 @@ api_key_env = "DEEPSEEK_API_KEY"
 model = "deepseek-v4-flash"
 temperature = 0
 tools = ["read_file", "write_file", "web_search", "web_fetch", "submit_artifact"]
-blocked_path_patterns = [".git", ".git/**", ".batchagent", ".batchagent/**", ".env", "**/.env", "**/*.pem", "**/*.key"]
+blocked_path_patterns = [".git", ".git/**", ".batchagent", ".batchagent/**", ".bagent", ".bagent/**", ".env", "**/.env", "**/*.pem", "**/*.key"]
 command_clean_env = true
 
 system_prompt = """
@@ -59,7 +59,7 @@ require_artifact_path = true
 required_metadata_keys = ["task_id", "status"]
 ```
 
-`tools` is explicit. If omitted or empty, no tools are loaded. If `require_submit = true`, `submit_artifact` must be included.
+`tools` is explicit for the native harness. If omitted or empty, no native tools are loaded. With `require_submit = true`, native execution must include `submit_artifact`; OpenCode/Claude receive it through the injected MCP server.
 
 Prompt templates support `CURR_DATE` and `{{CURR_DATE}}`; both are replaced when a task is dispatched with the current local date in `YYYY-MM-DD` format. Use it for date-sensitive research and status reports.
 
@@ -77,51 +77,53 @@ In unattended batch mode, avoid `run_command` unless there is a concrete need. P
 
 ## Execution Workflow
 
+Use the primary `bagent` executable in new workflows. The legacy `batchagent` executable remains a compatibility alias.
+
 1. Validate the manifest:
 
 ```bash
-python -m batchagent doctor BATCHAGENT.md
+bagent doctor BATCHAGENT.md
 ```
 
 2. Run a small limit first:
 
 ```bash
-python -m batchagent run BATCHAGENT.md --limit 1
+bagent run BATCHAGENT.md --limit 1
 ```
 
 3. Inspect status:
 
 ```bash
-python -m batchagent status BATCHAGENT.md
+bagent status BATCHAGENT.md
 ```
 
 4. Run the full batch:
 
 ```bash
-python -m batchagent run BATCHAGENT.md
+bagent run BATCHAGENT.md
 ```
 
-The run command uses a Rich live dashboard when available. Use `--plain` for line-oriented logs, `--no-progress` for quiet execution, and `--focus <task-id>` to keep one task visible in the dashboard.
+The run command opens the Textual TUI by default. Use `--plain` for line-oriented logs, `--no-progress` for quiet execution, and `--focus <task-id>` to keep one Task visible.
 
-5. If interrupted, recover stale leases:
+5. List Runs and resume an interrupted Run with the same `run_id`:
 
 ```bash
-python -m batchagent recover BATCHAGENT.md --to retry
+bagent runs BATCHAGENT.md
+bagent resume BATCHAGENT.md <run-id>
 ```
 
 6. Inspect or retry failures:
 
 ```bash
-python -m batchagent failures BATCHAGENT.md
-python -m batchagent inspect BATCHAGENT.md <task-id>
-python -m batchagent retry BATCHAGENT.md <task-id>
-python -m batchagent run BATCHAGENT.md --only <task-id>
-python -m batchagent rerun BATCHAGENT.md <task-id>
+bagent failures BATCHAGENT.md
+bagent inspect BATCHAGENT.md <task-id> --run-id <run-id>
+bagent retry BATCHAGENT.md <task-id> --run-id <run-id>
+bagent rerun BATCHAGENT.md <task-id>
 ```
 
 ## Completion Rule
 
-Do not mark a task complete from natural language alone. The agent must call `submit_artifact`; the harness validates that submission and updates the manifest.
+Do not mark a Task complete from natural language alone. The agent must call `submit_artifact`; the harness validates that submission and stores the Attempt result in `~/.bagent/state.sqlite3`.
 
 ## Recommended Task Row Shape
 

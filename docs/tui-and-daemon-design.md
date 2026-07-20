@@ -4,36 +4,37 @@
 
 The current implementation is a single-process runner with a full-screen Textual TUI:
 
-- `python -m batchagent` starts a persistent full-screen TUI.
-- `python -m batchagent tui <manifest>` starts the same TUI with a selected manifest.
-- `python -m batchagent run <manifest>` keeps direct non-interactive execution.
-- The bottom command input accepts `/show_batch`, `/run`, `/show_task`, `/history`, `/retry`, `/rerun`, `/refresh`, and `/quit`.
+- `bagent` starts a persistent full-screen TUI.
+- `bagent tui <manifest>` starts the same TUI with a selected manifest.
+- `bagent run <manifest>` opens the TUI with the manifest selected and starts `/run` automatically.
+- The bottom command input accepts `/show_batch`, `/show_run`, `/run`, `/resume`, `/show_task`, `/history`, `/retry`, `/rerun`, `/harness`, `/theme`, `/refresh`, and `/quit`.
 - Typing `/` opens command candidates with usage examples and descriptions.
 - `Up` / `Down` selects a command candidate and `Tab` accepts it.
-- Completion covers the current command, discovered manifest path, option, or task id from the selected manifest. `/show_batch` and `/run` accept manifest paths only.
+- Completion covers commands, manifest paths, Run ids, Task ids, harness names, themes, and options in the current context.
 - The left sidebar is batch context only: discovered manifests and the current selected batch.
-- Clicking a batch row selects that Batch Config. Clicking a task row opens the same task detail modal as `/show_task <task-id>`.
+- Clicking a Batch Config first opens its Run list. Clicking a Run opens its Task list. Clicking a Task opens the same Attempt-aware detail modal as `/show_task <task-id>`.
 - The top panel repeats the selected batch so every page has explicit batch context.
-- `/show_task <task-id>` opens an independent task detail modal. It shows live progress when available and falls back to persisted SQLite messages, tool events, artifacts, and errors for prior runs.
+- `/show_task <task-id>` opens an independent detail modal. It lists every `attempt_id` in the selected Run and shows the chosen Attempt's timing, usage, messages, tool events, artifacts, result, and errors.
 - `Ctrl+C` is left for terminal/input copy behavior; exiting the TUI is `Ctrl+Q`, `/quit`, or `/exit`.
-- If a Batch Config declares `run_variables`, `/run` opens a runtime-variable modal before creating the Batch Work.
+- If a Batch Config declares `run_variables`, `/run` opens a runtime-variable modal before creating the Run.
 - The scheduler emits structured progress events.
 - The TUI consumes those events and renders manifest, batch, run, and task pages.
 - While a task is running, the detail field shows model deltas and tool activity.
 - When a task completes, the detail field switches to the artifact path or artifact record.
-- A Batch Config is the manifest file. A Batch Work is one `/run` invocation and has a `work_id`. Each task attempt inside the work has a unique `run_id` and `.batchagent/runs/<task>-<run_id>` directory. Re-running a Batch Config creates a new Batch Work and keeps previous run directories, artifacts, and SQLite history.
+- The hierarchy is Batch Config -> Run (`run_id`) -> Task (`task_id`) -> Attempt (`attempt_id`). Resume retains the Run id, retry appends an Attempt, and rerun creates another Run. Runtime data lives under `~/.bagent` by default.
+- `/harness` persists the default local runtime, and `/theme` plus Textual's theme picker persist color selection in `~/.bagent/settings.json`.
 - `--plain` and `--no-progress` remain available for logs and automation.
 
-This keeps execution deterministic: disabling the TUI does not change scheduling, tool calls, retries, or manifest writeback.
+This keeps execution deterministic: disabling the TUI does not change scheduling, tool calls, retries, artifact validation, or SQLite state transitions.
 
 ## Page Model
 
 Recommended navigation model:
 
-1. Batch list page: multiple manifests/batch runs, their state, start/stop/recover actions.
-2. Batch run page: current dashboard with task table, progress, ETA, and focused task summary.
-3. Task run page: model output tail, tool call timeline, artifact submission, errors, and links to persisted SQLite records.
-4. History page: persisted run records for all tasks or one selected task, including run id, attempt, status, timestamps, run directory, and error.
+1. Batch Config list: discovered manifests and latest state.
+2. Run list: persisted Runs for the selected Batch Config, including status, harness, duration, tokens, and result.
+3. Run Task page: Task status, Attempt count, duration, tokens, result, live progress, and resume/retry actions.
+4. Task detail: immutable Attempt ids, timing, model/tool timeline, artifact submission, external session id, and errors.
 
 The current code implements these pages for local manifests in one process. The next daemon version should lift the same page model over multiple concurrent server-owned runs.
 
@@ -43,11 +44,11 @@ A full singleton server/client design is useful once BatchAgent needs multiple c
 
 Recommended shape:
 
-- First `batchagent` process becomes a local daemon/server and owns the state store.
-- Later `batchagent` invocations become clients that connect to the server.
+- First `bagent` process becomes a local daemon/server and owns the state store.
+- Later `bagent` invocations become clients that connect to the server.
 - The server manages multiple batch run processes, run locks, cancellation, recovery, and persisted event streams.
 - Clients render TUI pages, request new batch starts, attach to existing runs, inspect task details, and send retry/rerun/cancel commands.
-- Transport can start with local TCP on `127.0.0.1` or a Unix/Windows named pipe, with an auth token stored in `.batchagent/server.json`.
+- Transport can start with local TCP on `127.0.0.1` or a Unix/Windows named pipe, with an auth token stored in `~/.bagent/server.json`.
 - State should remain in SQLite so clients can reconnect even if the UI exits.
 
 This should be implemented after the event stream stabilizes. The current event schema is intentionally server-compatible: events already describe batch loading, task start/retry/done/fail, model deltas, tool calls, and artifact submission.

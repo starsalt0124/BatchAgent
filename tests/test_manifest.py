@@ -50,6 +50,20 @@ class ManifestTests(unittest.TestCase):
             self.assertEqual(manifest.config.run_variables[0].name, "market")
             self.assertEqual(manifest.config.run_variables[0].label, "Market scope")
 
+    def test_parses_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "BATCHAGENT.md"
+            create_sample_manifest(path)
+            text = path.read_text(encoding="utf-8")
+            text = text.replace(
+                "tools = [\"write_file\", \"submit_artifact\"]",
+                "tools = [\"write_file\", \"submit_artifact\"]\nskills = [\"patch-compatibility-analyzer\"]\nskill_roots = [\"skills\"]",
+            )
+            path.write_text(text, encoding="utf-8")
+            manifest = load_manifest(path)
+            self.assertEqual(manifest.config.skills, ["patch-compatibility-analyzer"])
+            self.assertEqual(manifest.config.skill_roots, ["skills"])
+
 
 if __name__ == "__main__":
     unittest.main()

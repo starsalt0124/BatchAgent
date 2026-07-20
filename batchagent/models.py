@@ -27,13 +27,31 @@ class RunVariable:
 
 
 @dataclass
+class HarnessConfig:
+    """Configuration for the runtime that executes one task attempt.
+
+    ``provider`` remains the model API used by the built-in/native harness.  A
+    harness is deliberately a separate concept because external CLIs own their
+    own model, authentication, sessions, and tools.
+    """
+
+    name: str = "native"
+    command: list[str] = field(default_factory=list)
+    extra_args: list[str] = field(default_factory=list)
+    model: str = ""
+    agent: str = ""
+    inject_tools: bool = True
+    env_allowlist: list[str] = field(default_factory=list)
+
+
+@dataclass
 class BatchConfig:
     version: int = 1
     name: str = "batchagent"
     workspace: str = "."
     workspace_mode: str = "shared"
-    copy_exclude: list[str] = field(default_factory=lambda: [".git", ".batchagent", "__pycache__"])
-    run_dir: str = ".batchagent/runs"
+    copy_exclude: list[str] = field(default_factory=lambda: [".git", ".batchagent", ".bagent", "__pycache__"])
+    run_dir: str = "~/.bagent/runs"
     parallel: bool = False
     max_concurrency: int = 1
     retries: int = 0
@@ -47,6 +65,7 @@ class BatchConfig:
     max_tokens: int | None = None
     request_timeout_seconds: int = 120
     provider_retries: int = 2
+    dialog_recovery_attempts: int = 5
     reasoning_effort: str = ""
     thinking: str = ""
     system_prompt: str = ""
@@ -54,7 +73,12 @@ class BatchConfig:
     run_variables: list[RunVariable] = field(default_factory=list)
     run_vars: dict[str, Any] = field(default_factory=dict)
     memory_files: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
+    skill_roots: list[str] = field(default_factory=list)
+    task_selector_script: str = ""
+    task_selector_command: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
+    command_policy: str = "allowlist"
     allowed_command_prefixes: list[list[str]] = field(default_factory=list)
     blocked_command_patterns: list[str] = field(default_factory=list)
     blocked_path_patterns: list[str] = field(
@@ -74,6 +98,7 @@ class BatchConfig:
     command_clean_env: bool = True
     web_timeout_seconds: int = 15
     web_max_chars: int = 20000
+    harness: HarnessConfig = field(default_factory=HarnessConfig)
     artifact: ArtifactPolicy = field(default_factory=ArtifactPolicy)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -143,6 +168,10 @@ class AgentRunResult:
     task_id: str
     run_dir: Path
     work_id: str = ""
+    run_id: str = ""
+    attempt_id: str = ""
+    harness: str = "native"
+    usage: dict[str, Any] = field(default_factory=dict)
     artifact_record_path: Path | None = None
     artifact: ArtifactSubmission | None = None
     error: str = ""

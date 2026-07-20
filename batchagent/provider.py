@@ -15,6 +15,9 @@ class ProviderError(RuntimeError):
     pass
 
 
+SUPPORTED_PROVIDERS = {"deepseek", "openai-compatible", "opencodego"}
+
+
 @dataclass
 class OpenAICompatibleProvider:
     config: BatchConfig
@@ -35,6 +38,8 @@ class OpenAICompatibleProvider:
             "stream": delta_callback is not None,
             "temperature": self.config.temperature,
         }
+        if delta_callback is not None:
+            payload["stream_options"] = {"include_usage": True}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -49,7 +54,7 @@ class OpenAICompatibleProvider:
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "batchagent/0.1",
+            "User-Agent": "bagent/0.2",
         }
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -67,7 +72,7 @@ class OpenAICompatibleProvider:
                 last_error = ProviderError(f"provider HTTP {exc.code}: {body}")
                 if exc.code not in {408, 409, 429, 500, 502, 503, 504}:
                     break
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            except (urllib.error.URLError, TimeoutError, OSError, ConnectionError, json.JSONDecodeError) as exc:
                 last_error = exc
 
             if attempt < self.config.provider_retries:
@@ -82,7 +87,7 @@ class OpenAICompatibleProvider:
         url = self.config.base_url.rstrip("/") + "/models"
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "User-Agent": "batchagent/0.1",
+            "User-Agent": "bagent/0.2",
         }
         request = urllib.request.Request(url, headers=headers, method="GET")
         with urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds) as response:
@@ -90,7 +95,7 @@ class OpenAICompatibleProvider:
 
 
 def create_provider(config: BatchConfig) -> OpenAICompatibleProvider:
-    if config.provider not in {"deepseek", "openai-compatible"}:
+    if config.provider not in SUPPORTED_PROVIDERS:
         raise ProviderError(f"unsupported provider: {config.provider}")
     return OpenAICompatibleProvider(config)
 
@@ -117,18 +122,33 @@ def _parse_chat_response(payload: dict[str, Any]) -> ChatMessage:
                 arguments=args,
             )
         )
+    raw_message = dict(message)
+    response_metadata = {
+        key: payload[key]
+        for key in ("id", "model", "created", "system_fingerprint")
+        if payload.get(key) is not None
+    }
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        response_metadata["usage"] = usage
+    if response_metadata:
+        # Provider response metadata is kept out of the assistant wire message,
+        # but remains available to the persistence layer for durable statistics.
+        raw_message["_bagent_response"] = response_metadata
     return ChatMessage(
         role=str(message.get("role") or "assistant"),
         content=message.get("content"),
         tool_calls=tool_calls,
-        raw=message,
+        raw=raw_message,
     )
 
 
 def _parse_stream_response(response, delta_callback: Callable[[str], None]) -> ChatMessage:
     content_parts: list[str] = []
+    reasoning_content_parts: list[str] = []
     tool_calls_by_index: dict[int, dict[str, Any]] = {}
     role = "assistant"
+    response_metadata: dict[str, Any] = {}
     for raw_line in response:
         line = raw_line.decode("utf-8", errors="replace").strip()
         if not line or not line.startswith("data:"):
@@ -140,11 +160,19 @@ def _parse_stream_response(response, delta_callback: Callable[[str], None]) -> C
             payload = json.loads(data)
         except json.JSONDecodeError:
             continue
+        for key in ("id", "model", "created", "system_fingerprint"):
+            if payload.get(key) is not None:
+                response_metadata[key] = payload[key]
+        if isinstance(payload.get("usage"), dict):
+            response_metadata["usage"] = payload["usage"]
         choices = payload.get("choices") or []
         if not choices:
             continue
         delta = choices[0].get("delta") or {}
         role = str(delta.get("role") or role)
+        reasoning_content = delta.get("reasoning_content")
+        if reasoning_content:
+            reasoning_content_parts.append(str(reasoning_content))
         content = delta.get("content")
         if content:
             content_parts.append(str(content))
@@ -168,6 +196,10 @@ def _parse_stream_response(response, delta_callback: Callable[[str], None]) -> C
         "role": role,
         "content": "".join(content_parts) if content_parts else None,
     }
+    if reasoning_content_parts:
+        message["reasoning_content"] = "".join(reasoning_content_parts)
     if tool_calls:
         message["tool_calls"] = tool_calls
-    return _parse_chat_response({"choices": [{"message": message}]})
+    parsed_payload: dict[str, Any] = {"choices": [{"message": message}]}
+    parsed_payload.update(response_metadata)
+    return _parse_chat_response(parsed_payload)

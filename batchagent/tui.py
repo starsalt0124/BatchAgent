@@ -4,6 +4,7 @@ import asyncio
 import json
 import shlex
 import threading
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -15,21 +16,36 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
+from .harness import available_harnesses, probe_harness
 from .manifest import ManifestError, load_manifest
 from .models import Manifest, RunVariable, Task
 from .progress import ProgressState, _format_seconds
-from .scheduler import mark_tasks_for_retry, new_work_id, rerun_tasks, run_manifest, state_db_path, status, validate_manifest
+from .scheduler import (
+    new_run_id,
+    request_pause,
+    resume_manifest,
+    run_manifest,
+    state_db_path,
+    status,
+    validate_manifest,
+)
+from .settings import DEFAULT_SETTINGS, SettingsError, load_settings, save_settings
 from .store import SessionStore
 from .util import console_safe, truncate
 
 
 COMMAND_SPECS = [
-    ("/show_batch", "/show_batch <manifest-path>", "Select and inspect a batch configuration file."),
-    ("/run", "/run [manifest-path] [--only task-id] [--retry-failed]", "Start a batch work from the selected batch configuration."),
-    ("/show_task", "/show_task <task-id>", "Show the selected task row and live task detail."),
-    ("/history", "/history [task-id|all]", "Show persisted run history for the current batch."),
-    ("/retry", "/retry <task-id|all>", "Mark failed task(s) as retry without deleting prior history."),
-    ("/rerun", "/rerun <task-id>", "Reset task status to todo; prior run directories are kept."),
+    ("/show_batch", "/show_batch <manifest-path>", "Select a Batch Config and list its persisted Runs."),
+    ("/run", "/run [manifest-path] [--only task-id] [--harness name]", "Create a new Run from the selected Batch Config."),
+    ("/show_run", "/show_run <run-id>", "Open one Run and list its Tasks."),
+    ("/resume", "/resume <run-id>", "Resume queued or interrupted Tasks in an incomplete Run."),
+    ("/pause", "/pause [run-id]", "Safely pause an active Run after current Attempts finish."),
+    ("/show_task", "/show_task <task-id>", "Show Attempts and durable output for a Task in the selected Run."),
+    ("/history", "/history [run-id]", "Alias for the current Batch's Run list or one Run."),
+    ("/retry", "/retry <task-id>", "Execute a new Attempt for a failed Task in the selected Run."),
+    ("/rerun", "/rerun <task-id>", "Create a new Run containing the selected Task."),
+    ("/harness", "/harness [use|reset|doctor] [name]", "Show or persist the local task harness."),
+    ("/theme", "/theme [name]", "Show or persist the Textual color theme."),
     ("/refresh", "/refresh", "Reload manifests and current status."),
     ("/show_home", "/show_home", "Return to the manifest list page."),
     ("/help", "/help", "Show the home/help page."),
@@ -87,9 +103,11 @@ class TaskDetailScreen(ModalScreen[None]):
         ("escape", "close", "Close"),
     ]
 
-    def __init__(self, task_id: str):
+    def __init__(self, task_id: str, run_id: str = "", attempt_id: str = ""):
         super().__init__()
         self.task_id = task_id
+        self.run_id = run_id
+        self.attempt_id = attempt_id
         self._last_content = ""
 
     def compose(self) -> ComposeResult:
@@ -104,8 +122,9 @@ class TaskDetailScreen(ModalScreen[None]):
     def refresh_content(self) -> None:
         title = self.query_one("#task_modal_title", Static)
         body = self.query_one("#task_modal_body", RichLog)
-        title.update(f"Task Detail: {self.task_id}\nEsc closes this window.")
-        detail_text = getattr(self.app, "task_detail_text_for")(self.task_id)
+        context = f" in {self.run_id}" if self.run_id else ""
+        title.update(f"Task Detail: {self.task_id}{context}\nEsc closes this window.")
+        detail_text = getattr(self.app, "task_detail_text_for")(self.task_id, self.run_id, self.attempt_id)
         if detail_text == self._last_content:
             return
         self._last_content = detail_text
@@ -180,7 +199,7 @@ class RunVariablesScreen(ModalScreen[dict[str, str] | None]):
                 [
                     "Runtime Variables",
                     f"{self.index + 1}/{len(self.variables)} {variable.name}",
-                    "Enter saves this value. Esc cancels this batch work.",
+                    "Enter saves this value. Esc cancels this Run.",
                 ]
             )
         )
@@ -276,12 +295,25 @@ class BatchAgentTui(App[None]):
         ("ctrl+c", "copy", "Copy"),
         ("ctrl+q", "quit", "Quit"),
         ("f1", "help", "Help"),
+        ("ctrl+t", "change_theme", "Theme"),
         ("escape", "show_batch", "Batch"),
     ]
 
-    def __init__(self, start_manifest: str | None = None):
+    def __init__(self, start_manifest: str | None = None, auto_run_args: list[str] | None = None):
+        try:
+            self.settings = load_settings()
+            self.settings_error = ""
+        except SettingsError as exc:
+            self.settings = dict(DEFAULT_SETTINGS)
+            self.settings_error = str(exc)
+        self._settings_ready = False
         super().__init__()
+        configured_theme = str(self.settings.get("theme") or DEFAULT_SETTINGS["theme"])
+        if configured_theme in self.available_themes:
+            self.theme = configured_theme
+        self._settings_ready = True
         self.start_manifest = start_manifest
+        self.auto_run_args = auto_run_args
         self.manifest_paths: list[Path] = []
         self.selected_manifest_path: Path | None = None
         self.selected_manifest: Manifest | None = None
@@ -289,14 +321,39 @@ class BatchAgentTui(App[None]):
         self.focus_task_id = ""
         self.progress_state: ProgressState | None = None
         self.run_task: asyncio.Task | None = None
+        self.pause_event: asyncio.Event | None = None
+        self.pause_requested = False
+        self.exit_after_pause = False
         self.run_results: list[Any] = []
         self.current_work_id = ""
+        self.selected_run_id = ""
+        self.active_run_id = ""
+        self.active_manifest_path: Path | None = None
+        self.harness_name = str(self.settings.get("harness") or "native")
         self.ui_thread = 0
         self.history_task_id = ""
         self._completion_value = ""
         self._completion_candidates: list[str] = []
         self._completion_index = 0
         self._completion_input = ""
+        self._detail_content_key = ""
+        self._run_table_keys: list[str] = []
+        self._run_render_dirty = False
+        self._auto_run_started = False
+
+    def _watch_theme(self, theme_name: str) -> None:
+        super()._watch_theme(theme_name)
+        if getattr(self, "_settings_ready", False):
+            try:
+                self._save_preferences({"theme": theme_name})
+            except SettingsError:
+                pass
+
+    def _save_preferences(self, changes: dict[str, Any]) -> None:
+        values = dict(self.settings)
+        values.update(changes)
+        save_settings(values)
+        self.settings = values
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -323,6 +380,12 @@ class BatchAgentTui(App[None]):
             self.load_manifest(Path(self.start_manifest))
             self.page = "batch"
         self.render_page()
+        if self.settings_error:
+            self.notify(f"settings fallback: {self.settings_error}", severity="warning")
+        self.set_interval(0.5, self.flush_run_render)
+        if self.auto_run_args is not None and not self._auto_run_started:
+            self._auto_run_started = True
+            await self.command_run(list(self.auto_run_args))
 
     def discover_manifests(self) -> None:
         candidates: list[Path] = []
@@ -377,6 +440,8 @@ class BatchAgentTui(App[None]):
                     "Current Batch",
                     self.selected_manifest.config.name,
                     truncate(self.display_manifest_path(self.selected_manifest.path), 64),
+                    f"selected run: {self.selected_run_id or '(none)'}",
+                    f"active run: {self.active_run_id or '(none)'}",
                     f"page: {self.page}",
                 ]
             )
@@ -433,7 +498,7 @@ class BatchAgentTui(App[None]):
 
     def render_batch(self) -> None:
         manifest = self.require_manifest()
-        counts = status(manifest.path)
+        rows = self.batch_run_rows()
         self.query_one("#title", Static).update(
             Panel(
                 "\n".join(
@@ -441,38 +506,44 @@ class BatchAgentTui(App[None]):
                         self.selected_batch_line(),
                         f"Manifest: {manifest.path}",
                         f"Name: {manifest.config.name}",
-                        f"Model: {manifest.config.provider}/{manifest.config.model}",
-                        f"Concurrency: {manifest.config.effective_concurrency}",
-                        "Status: " + ", ".join(f"{key}={value}" for key, value in sorted(counts.items())),
+                        f"Runs: {len(rows)}",
+                        f"Default harness: {self.harness_name}",
+                        "Select a Run to inspect its Tasks, or use /run to create one.",
                     ]
                 ),
-                title="Batch",
+                title="Batch Config → Runs",
             )
         )
         table = self.query_one("#table", DataTable)
         table.clear(columns=True)
-        table.add_columns("Status", "Task", "Kind", "Attempts", "Output/Error")
-        for task in manifest.tasks:
+        table.add_columns("Run ID", "Status", "Harness", "Tasks", "Elapsed", "Tokens", "Started", "Result / Error")
+        for row in rows:
+            result = row.get("error") or json.dumps(row.get("result") or {}, ensure_ascii=False)
             table.add_row(
-                task.status,
-                task.id,
-                task.kind,
-                str(task.attempts),
-                truncate(task.error or task.result or json.dumps(task.input, ensure_ascii=False), 140),
-                key=f"task:{task.id}",
+                str(row["run_id"]),
+                str(row["status"]),
+                str(row.get("harness") or "native"),
+                str(len(row.get("selected_task_ids") or [])),
+                _format_seconds(float(row.get("elapsed_seconds") or 0)),
+                str(row.get("total_tokens") if row.get("total_tokens") is not None else "-"),
+                str(row.get("started_at") or ""),
+                truncate(result, 120),
+                key=f"run:{row['run_id']}",
             )
         self.set_detail(
             [
-                "Batch page:",
-                "  The center table lists tasks from the selected batch.",
-                "  The Output/Error column shows the latest manifest result or error.",
-                "  Type / in the bottom input for commands and examples.",
+                "Hierarchy: Batch Config → Run → Task → Attempt",
+                "Each /run creates an immutable run_id and freezes the selected Tasks, variables, and harness.",
+                "Use /resume <run-id> for unfinished work. Use /retry <task-id> inside a selected Run.",
                 "",
-                "Every /run attempt creates a new .batchagent/runs/<task>-<run_id> directory; old results stay available in /history.",
+                "No Runs yet." if not rows else "Press Enter on a row or use /show_run <run-id>.",
             ]
         )
 
     def render_run(self) -> None:
+        if not (self.run_task and not self.run_task.done() and self.selected_run_id == self.active_run_id):
+            self.render_persisted_run()
+            return
         state = self.require_progress()
         counts = state.counts()
         eta = state.eta_seconds()
@@ -485,88 +556,196 @@ class BatchAgentTui(App[None]):
                 "\n".join(
                     [
                         self.selected_batch_line(),
-                        f"Batch Work: {state.work_id or self.current_work_id or '(pending)'}",
+                        f"Run: {state.work_id or self.active_run_id or '(pending)'}",
                         f"Config: {state.manifest.path}",
                         f"loaded={state.total_tasks} selected={state.eligible_tasks} running={running} queued={queued} done={done} failed={failed}",
                         f"elapsed={_format_seconds(state.elapsed())} eta={'unknown' if eta is None else _format_seconds(eta)}",
+                        state.pause_detail if state.paused else ("pause requested: waiting for running task(s) to finish" if self.pause_requested else ""),
                         "run dirs are unique per attempt; existing task results are not overwritten on disk",
                     ]
                 ),
-                title="Running Batch",
+                title="Run → Tasks (live)",
+            )
+        )
+        self.render_run_table(state)
+        self.render_focused_task_detail()
+
+    def render_persisted_run(self) -> None:
+        manifest = self.require_manifest()
+        run_id = self.selected_run_id
+        if not run_id:
+            self.page = "batch"
+            self.render_batch()
+            return
+        store = self.open_store_if_present()
+        if store is None:
+            raise RuntimeError("No persisted state database yet.")
+        try:
+            run = store.batch_run(run_id)
+            tasks = store.run_tasks(run_id)
+        finally:
+            store.close()
+        if run is None or run["manifest_path"] != str(manifest.path.resolve()):
+            raise RuntimeError(f"run not found for selected batch: {run_id}")
+        self.query_one("#title", Static).update(
+            Panel(
+                "\n".join(
+                    [
+                        self.selected_batch_line(),
+                        f"Run: {run_id}",
+                        f"Status: {run['status']}  Harness: {run['harness']} {run.get('harness_version') or ''}",
+                        f"Started: {run['started_at']}  Finished: {run.get('finished_at') or '-'}",
+                        f"Elapsed: {_format_seconds(float(run.get('elapsed_seconds') or 0))}  Tokens: {run.get('total_tokens') if run.get('total_tokens') is not None else '-'}",
+                        f"Tasks: {len(tasks)}  Variables: {json.dumps(run.get('run_vars') or {}, ensure_ascii=False)}",
+                    ]
+                ),
+                title="Run → Tasks",
             )
         )
         table = self.query_one("#table", DataTable)
         table.clear(columns=True)
-        table.add_columns("Status", "Task", "Attempts", "Run Time", "Detail")
-        now = __import__("time").monotonic()
-        for task in state.ordered_tasks():
-            detail = task.detail or task.error or task.artifact_path or task.result or task.run_dir
+        table.add_columns("Status", "Task", "Kind", "Attempts", "Elapsed", "Tokens", "Result / Error")
+        for row in tasks:
+            result = row.get("error") or json.dumps(row.get("result") or {}, ensure_ascii=False)
             table.add_row(
-                task.status,
-                task.id,
-                str(task.attempts),
-                _format_seconds(task.elapsed_current(now)),
-                truncate(detail, 160),
-                key=f"task:{task.id}",
-            )
-        self.render_focused_task_detail()
-
-    def render_history(self) -> None:
-        manifest = self.require_manifest()
-        rows = self.history_rows(self.history_task_id or None)
-        title_lines = [
-            self.selected_batch_line(),
-            f"Manifest: {manifest.path}",
-            f"History: {self.history_task_id or 'all tasks'}",
-            "Each run has an immutable run_id and a separate run directory.",
-        ]
-        self.query_one("#title", Static).update(Panel("\n".join(title_lines), title="Run History"))
-        table = self.query_one("#table", DataTable)
-        table.clear(columns=True)
-        table.add_columns("Work ID", "Task", "Run ID", "Attempt", "Status", "Started", "Finished", "Run Dir", "Error")
-        for row in rows:
-            table.add_row(
-                row.get("work_id", ""),
-                row["task_id"],
-                row["run_id"],
-                str(row["attempt"]),
-                row["status"],
-                row["started_at"],
-                row["finished_at"] or "",
-                truncate(row["run_dir"], 80),
-                truncate(row["error"], 80),
-                key=f"task:{row['task_id']}",
+                str(row["status"]),
+                str(row["task_id"]),
+                str(row.get("kind") or ""),
+                str(row.get("attempt_count") or 0),
+                _format_seconds(float(row.get("elapsed_seconds") or 0)),
+                str(row.get("total_tokens") if row.get("total_tokens") is not None else "-"),
+                truncate(result, 140),
+                key=f"run-task:{run_id}:{row['task_id']}",
             )
         self.set_detail(
             [
-                f"history rows: {len(rows)}",
-                "History page:",
-                "  Rows are persisted SQLite run records for the selected batch.",
-                "  The manifest stores the latest result, while this page keeps prior runs visible.",
-                "  Type /history <task-id> or /show_task <task-id> in the bottom input.",
+                f"Run {run_id} has {len(tasks)} Task(s).",
+                "Open a Task to see every immutable attempt_id, timing, usage, messages, tools, and artifacts.",
+                "Resume preserves this run_id. Retry creates a new attempt_id for one failed Task.",
             ]
         )
 
+    def batch_run_rows(self) -> list[dict[str, Any]]:
+        manifest = self.require_manifest()
+        store = self.open_store_if_present()
+        if store is None:
+            return []
+        try:
+            return store.batch_runs(manifest.path)
+        finally:
+            store.close()
+
+    def open_store_if_present(self) -> SessionStore | None:
+        manifest = self.require_manifest()
+        db_path = state_db_path(manifest)
+        if not db_path.exists():
+            return None
+        return SessionStore(db_path)
+
+    def persisted_run_snapshot(self, run_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        manifest = self.require_manifest()
+        store = self.open_store_if_present()
+        if store is None:
+            raise RuntimeError("No persisted state database yet.")
+        try:
+            run = store.batch_run(run_id)
+            if run is None:
+                raise RuntimeError(f"run not found: {run_id}")
+            expected_path = str(manifest.path.resolve())
+            if str(run["manifest_path"]) != expected_path:
+                raise RuntimeError(f"run {run_id} belongs to another batch config: {run['manifest_path']}")
+            return run, store.run_tasks(run_id)
+        finally:
+            store.close()
+
+    def render_run_table(self, state: ProgressState) -> None:
+        table = self.query_one("#table", DataTable)
+        now = time.monotonic()
+        rows: list[tuple[str, tuple[str, str, str, str, str, str]]] = []
+        for task in state.ordered_tasks():
+            detail = task.detail or task.error or task.artifact_path or task.result or task.run_dir
+            rows.append(
+                (
+                    f"task:{task.id}",
+                    (
+                        task.status,
+                        task.id,
+                        str(task.attempts),
+                        task.attempt_id or "-",
+                        _format_seconds(task.elapsed_current(now)),
+                        truncate(detail, 160),
+                    ),
+                )
+            )
+        row_keys = [key for key, _values in rows]
+        if self._run_table_keys != row_keys:
+            self.rebuild_run_table(table, rows)
+            return
+        column_keys = ("status", "task", "attempts", "attempt_id", "runtime", "detail")
+        for row_key, values in rows:
+            for column_key, value in zip(column_keys, values):
+                try:
+                    if table.get_cell(row_key, column_key) != value:
+                        table.update_cell(row_key, column_key, value, update_width=False)
+                except Exception:
+                    self.rebuild_run_table(table, rows)
+                    return
+
+    def rebuild_run_table(self, table: DataTable, rows: list[tuple[str, tuple[str, str, str, str, str, str]]]) -> None:
+        scroll_y = table.scroll_y
+        table.clear(columns=True)
+        table.add_columns(
+            ("Status", "status"),
+            ("Task", "task"),
+            ("Attempts", "attempts"),
+            ("Attempt ID", "attempt_id"),
+            ("Run Time", "runtime"),
+            ("Detail", "detail"),
+        )
+        for row_key, values in rows:
+            table.add_row(*values, key=row_key)
+        self._run_table_keys = [key for key, _values in rows]
+        try:
+            table.scroll_to(y=scroll_y, animate=False, force=True)
+        except Exception:
+            pass
+
+    def render_history(self) -> None:
+        if self.selected_run_id:
+            self.render_persisted_run()
+        else:
+            self.render_batch()
+
     def render_focused_task_detail(self, full: bool = False) -> None:
-        detail = self.query_one("#detail", RichLog)
-        detail.clear()
         task = self.current_task_progress()
         if task is not None:
-            detail.write(Panel(self.task_progress_text(task, full=full), title=f"Task {task.id}"))
+            text = self.task_progress_text(task, full=full)
+            self.write_detail(Panel(text, title=f"Task {task.id}"), f"task-progress:{task.id}:{text}")
             return
         manifest = self.selected_manifest
         if manifest and self.focus_task_id:
             row = next((item for item in manifest.tasks if item.id == self.focus_task_id), None)
             if row:
-                detail.write(Panel(self.task_row_text(row), title=f"Task {row.id}"))
+                text = self.task_row_text(row)
+                self.write_detail(Panel(text, title=f"Task {row.id}"), f"task-row:{row.id}:{text}")
                 return
-        detail.write("No focused task. Use /show_task <task-id>.")
+        self.write_detail("No focused task. Use /show_task <task-id>.", "no-focused-task")
 
     def set_detail(self, lines: list[str]) -> None:
+        text = "\n".join(lines)
+        self.write_detail(text, f"lines:{text}")
+
+    def write_detail(self, content: Any, content_key: str) -> None:
+        if content_key == self._detail_content_key:
+            return
         detail = self.query_one("#detail", RichLog)
+        scroll_y = detail.scroll_y
+        was_at_end = detail.is_vertical_scroll_end
         detail.clear()
-        for line in lines:
-            detail.write(line)
+        detail.write(content, scroll_end=was_at_end)
+        if not was_at_end:
+            detail.scroll_to(y=scroll_y, animate=False, force=True)
+        self._detail_content_key = content_key
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         key = self.row_key_value(event)
@@ -578,9 +757,24 @@ class BatchAgentTui(App[None]):
             except Exception as exc:
                 self.notify(str(exc), severity="error")
             return
+        if key.startswith("run:"):
+            try:
+                self.selected_run_id = key.removeprefix("run:")
+                self.page = "run"
+                self.render_page()
+            except Exception as exc:
+                self.notify(str(exc), severity="error")
+            return
+        if key.startswith("run-task:"):
+            try:
+                _prefix, run_id, task_id = key.split(":", 2)
+                self.open_task_detail(task_id, run_id=run_id)
+            except Exception as exc:
+                self.notify(str(exc), severity="error")
+            return
         if key.startswith("task:"):
             try:
-                self.open_task_detail(key.removeprefix("task:"))
+                self.open_task_detail(key.removeprefix("task:"), run_id=self.active_run_id or self.selected_run_id)
             except Exception as exc:
                 self.notify(str(exc), severity="error")
 
@@ -595,7 +789,9 @@ class BatchAgentTui(App[None]):
             return []
         store = SessionStore(db_path)
         try:
-            return store.task_runs(task_id) if task_id else store.all_runs()
+            if self.selected_run_id:
+                return store.task_attempts(self.selected_run_id, task_id)
+            return store.batch_runs(manifest.path)
         finally:
             store.close()
 
@@ -683,9 +879,15 @@ class BatchAgentTui(App[None]):
         if candidate == "--only":
             return "--only <task-id> - Run exactly one task from the selected/current batch."
         if candidate == "--retry-failed":
-            return "--retry-failed - Include failed tasks in this Batch Work selection."
+            return "--retry-failed - Include failed Tasks when resuming; compatibility-only for a new Run."
         if candidate == "all":
             return "all - Apply to all relevant tasks or show all run history."
+        if candidate in available_harnesses():
+            return f"{candidate} - local task harness"
+        if candidate in self.available_themes:
+            return f"{candidate} - Textual color theme"
+        if candidate in self.run_completion_tokens():
+            return f"{candidate} - persisted Run"
         task = self.task_for_token(candidate)
         if task is not None:
             return f"{candidate} - task: status={task.status}, kind={task.kind or '-'}, attempts={task.attempts}"
@@ -701,22 +903,31 @@ class BatchAgentTui(App[None]):
             return self.filter_candidates(COMMANDS, token)
         if command in {"/show_batch"}:
             return self.filter_candidates(self.manifest_completion_tokens(), token)
-        if command in {"/show_task", "/retry", "/rerun", "/history"}:
+        if command in {"/show_run", "/resume", "/history"}:
+            return self.filter_candidates(self.run_completion_tokens(), token)
+        if command in {"/show_task", "/retry", "/rerun"}:
             candidates = self.task_completion_tokens()
-            if command in {"/retry", "/history"}:
-                candidates = ["all", *candidates]
             return self.filter_candidates(candidates, token)
         if command == "/run":
             return self.run_completion_candidates(before, token)
+        if command == "/harness":
+            tokens = before.strip().split()
+            if tokens and tokens[-1] in {"use", "doctor"}:
+                return self.filter_candidates(available_harnesses(), token)
+            return self.filter_candidates(["use", "reset", "doctor", *available_harnesses()], token)
+        if command == "/theme":
+            return self.filter_candidates(sorted(self.available_themes), token)
         return []
 
     def run_completion_candidates(self, before: str, token: str) -> list[str]:
         tokens = before.strip().split()
-        if tokens and tokens[-1] == "--only":
+        if tokens and tokens[-1] in {"--only", "--focus"}:
             return self.filter_candidates(self.task_completion_tokens(), token)
-        if tokens and tokens[-1] == "--var":
+        if tokens and tokens[-1] == "--harness":
+            return self.filter_candidates(available_harnesses(), token)
+        if tokens and tokens[-1] in {"--var", "--limit"}:
             return []
-        option_candidates = ["--only", "--retry-failed", "--var"]
+        option_candidates = ["--only", "--retry-failed", "--limit", "--focus", "--var", "--harness"]
         consumed_manifest = self.run_command_has_manifest(tokens)
         if token.startswith("-"):
             return self.filter_candidates(option_candidates, token)
@@ -729,10 +940,10 @@ class BatchAgentTui(App[None]):
         index = 1
         while index < len(tokens):
             item = tokens[index]
-            if item in {"--only", "--var"}:
+            if item in {"--only", "--var", "--limit", "--focus", "--harness", "--resume"}:
                 index += 2
                 continue
-            if item == "--retry-failed" or item.startswith("--var="):
+            if item == "--retry-failed" or item.startswith("--var=") or item.startswith("--limit=") or item.startswith("--focus="):
                 index += 1
                 continue
             if not item.startswith("-"):
@@ -802,7 +1013,21 @@ class BatchAgentTui(App[None]):
         manifest = self.selected_manifest
         if manifest is None:
             return []
+        if self.selected_run_id:
+            store = self.open_store_if_present()
+            if store is not None:
+                try:
+                    rows = store.run_tasks(self.selected_run_id)
+                    if rows:
+                        return [str(row["task_id"]) for row in rows]
+                finally:
+                    store.close()
         return [task.id for task in manifest.tasks]
+
+    def run_completion_tokens(self) -> list[str]:
+        if self.selected_manifest is None:
+            return []
+        return [str(row["run_id"]) for row in self.batch_run_rows()]
 
     def task_for_token(self, token: str) -> Task | None:
         manifest = self.selected_manifest
@@ -835,7 +1060,7 @@ class BatchAgentTui(App[None]):
         args = parts[1:]
         try:
             if name in {"/quit", "/exit"}:
-                self.exit()
+                await self.safe_quit()
             elif name == "/help":
                 self.page = "home"
                 self.render_home()
@@ -846,16 +1071,26 @@ class BatchAgentTui(App[None]):
                 self.render_page()
             elif name == "/show_batch":
                 self.command_show_batch(args)
+            elif name == "/show_run":
+                self.command_show_run(args)
             elif name == "/show_task":
                 self.command_show_task(args)
             elif name == "/history":
                 self.command_history(args)
             elif name == "/run":
                 await self.command_run(args)
+            elif name == "/resume":
+                await self.command_resume(args)
+            elif name == "/pause":
+                self.command_pause(args)
             elif name == "/retry":
-                self.command_retry(args)
+                await self.command_retry(args)
             elif name == "/rerun":
-                self.command_rerun(args)
+                await self.command_rerun(args)
+            elif name == "/harness":
+                await self.command_harness(args)
+            elif name == "/theme":
+                self.command_theme(args)
             else:
                 self.notify(f"Unknown command: {name}", severity="error")
         except Exception as exc:
@@ -878,83 +1113,242 @@ class BatchAgentTui(App[None]):
         self.page = "batch"
         self.render_page()
 
+    def action_show_batch(self) -> None:
+        if self.selected_manifest is None:
+            self.page = "home"
+        elif self.page == "run":
+            self.page = "batch"
+        else:
+            self.page = "home"
+        self.render_page()
+
+    def command_show_run(self, args: list[str]) -> None:
+        if len(args) != 1:
+            raise RuntimeError("Usage: /show_run <run-id>")
+        run_id = args[0]
+        if run_id not in self.run_completion_tokens():
+            raise RuntimeError(f"run not found for selected batch: {run_id}")
+        self.selected_run_id = run_id
+        self.page = "run"
+        self.render_page()
+
     def command_show_task(self, args: list[str]) -> None:
         if len(args) != 1:
             raise RuntimeError("Usage: /show_task <task-id>")
         self.focus_task_id = args[0]
-        self.open_task_detail(args[0])
+        self.open_task_detail(args[0], run_id=self.selected_run_id or self.active_run_id)
 
-    def open_task_detail(self, task_id: str) -> None:
-        if self.task_for_token(task_id) is None and not (self.progress_state and task_id in self.progress_state.tasks):
+    def open_task_detail(self, task_id: str, *, run_id: str = "", attempt_id: str = "") -> None:
+        if run_id:
+            store = self.open_store_if_present()
+            try:
+                persisted = store.run_task(run_id, task_id) if store is not None else None
+            finally:
+                if store is not None:
+                    store.close()
+            if persisted is None and not (self.progress_state and task_id in self.progress_state.tasks):
+                raise RuntimeError(f"task not found in run {run_id}: {task_id}")
+        elif self.task_for_token(task_id) is None and not (self.progress_state and task_id in self.progress_state.tasks):
             raise RuntimeError(f"task not found: {task_id}")
         self.focus_task_id = task_id
         if self.progress_state is not None:
             self.progress_state.focus_task_id = task_id
-        self.push_screen(TaskDetailScreen(task_id))
+        self.push_screen(TaskDetailScreen(task_id, run_id, attempt_id))
 
     def command_history(self, args: list[str]) -> None:
-        if args and args[0] not in {"all", "*"}:
-            self.history_task_id = args[0]
-            self.focus_task_id = args[0]
-        else:
-            self.history_task_id = ""
-        self.page = "history"
+        if len(args) > 1:
+            raise RuntimeError("Usage: /history [run-id]")
+        if args:
+            self.command_show_run(args)
+            return
+        self.selected_run_id = ""
+        self.page = "batch"
         self.render_page()
 
     async def command_run(self, args: list[str]) -> None:
         if self.run_task and not self.run_task.done():
             raise RuntimeError("A batch is already running in this TUI.")
-        token, only, retry_failed, inline_vars = self.parse_run_args(args)
+        token, only, retry_failed, inline_vars, limit, focus, harness, resume_id = self.parse_run_args(args)
         if token:
             self.load_manifest_by_token(token)
         manifest = self.require_manifest()
-        validate_manifest(manifest)
-        run_vars = await self.collect_run_vars(manifest, inline_vars)
-        if run_vars is None:
-            self.notify("batch work canceled", severity="warning")
-            return
-        work_id = new_work_id()
-        state = ProgressState.from_manifest(manifest, focus_task_id=only or self.focus_task_id)
-        state.work_id = work_id
+        if resume_id:
+            run_record, frozen_run_tasks = self.persisted_run_snapshot(resume_id)
+            if str(run_record["status"]) not in {"paused", "failed", "interrupted"}:
+                raise RuntimeError(f"run is not resumable: {resume_id} (status={run_record['status']})")
+            run_vars: dict[str, str] = {}
+            run_id = resume_id
+            progress_manifest = _manifest_with_frozen_run_tasks(manifest, frozen_run_tasks)
+        else:
+            validate_manifest(manifest, harness_name=harness or self.harness_name)
+            collected = await self.collect_run_vars(manifest, inline_vars)
+            if collected is None:
+                self.notify("run canceled", severity="warning")
+                return
+            run_vars = collected
+            run_id = new_run_id()
+            progress_manifest = manifest
+        focus_task = focus or (next(iter(only)) if only and len(only) == 1 else self.focus_task_id)
+        state = ProgressState.from_manifest(progress_manifest, focus_task_id=focus_task)
+        state.work_id = run_id
         self.progress_state = state
-        self.current_work_id = work_id
+        self.current_work_id = run_id
+        self.active_run_id = run_id
+        self.selected_run_id = run_id
+        self.active_manifest_path = manifest.path.resolve()
+        self.pause_event = asyncio.Event()
+        self.pause_requested = False
+        self.exit_after_pause = False
         self.focus_task_id = state.focus_task_id
         self.history_task_id = ""
+        self._run_table_keys = []
         self.page = "run"
         self.render_page()
-        task_ids = {only} if only else None
-        self.run_task = asyncio.create_task(
-            run_manifest(
+        if resume_id:
+            coroutine = resume_manifest(
                 manifest.path,
+                run_id,
+                task_ids=only,
                 retry_failed=retry_failed,
-                task_ids=task_ids,
-                work_id=work_id,
-                run_vars=run_vars,
+                harness=harness,
                 progress_callback=self.progress_callback,
+                pause_event=self.pause_event,
             )
-        )
+        else:
+            coroutine = run_manifest(
+                manifest.path,
+                limit=limit,
+                retry_failed=retry_failed,
+                task_ids=only,
+                run_id=run_id,
+                run_vars=run_vars,
+                harness=harness,
+                progress_callback=self.progress_callback,
+                pause_event=self.pause_event,
+            )
+        self.run_task = asyncio.create_task(coroutine)
         self.run_task.add_done_callback(self.finish_run)
 
-    def command_retry(self, args: list[str]) -> None:
-        manifest = self.require_manifest()
-        if not args or args[0] == "all":
-            changed = mark_tasks_for_retry(manifest.path)
-        else:
-            changed = mark_tasks_for_retry(manifest.path, set(args))
-        self.load_manifest(manifest.path)
-        self.notify(f"marked {changed} task(s) retry")
-        self.page = "batch"
+    async def command_resume(self, args: list[str]) -> None:
+        if len(args) != 1:
+            raise RuntimeError("Usage: /resume <run-id>")
+        await self.command_run(["--resume", args[0]])
+
+    async def action_quit(self) -> None:
+        await self.safe_quit()
+
+    async def safe_quit(self) -> None:
+        if self.run_task and not self.run_task.done():
+            self.exit_after_pause = True
+            self.request_current_pause()
+            self.notify("pause requested; exiting after running task(s) finish")
+            return
+        self.exit()
+
+    def command_pause(self, args: list[str]) -> None:
+        if args:
+            raise RuntimeError("Usage: /pause")
+        if not self.run_task or self.run_task.done():
+            raise RuntimeError("No batch is currently running in this TUI.")
+        self.request_current_pause()
+
+    def request_current_pause(self) -> None:
+        if self.active_run_id:
+            request_pause(self.active_run_id)
+        if self.pause_event is not None:
+            self.pause_event.set()
+        self.pause_requested = True
+        self._run_render_dirty = True
+        self.notify("pause requested; no new task will be started")
+
+    async def command_retry(self, args: list[str]) -> None:
+        if len(args) != 1:
+            raise RuntimeError("Usage: /retry <task-id>")
+        if not self.selected_run_id:
+            raise RuntimeError("Select a Run before retrying a Task.")
+        store = self.open_store_if_present()
+        if store is None:
+            raise RuntimeError("No persisted state database yet.")
+        try:
+            run = store.batch_run(self.selected_run_id)
+            if run is None:
+                raise RuntimeError(f"run not found: {self.selected_run_id}")
+            expected_path = str(self.require_manifest().path.resolve())
+            if str(run["manifest_path"]) != expected_path:
+                raise RuntimeError(
+                    f"run {self.selected_run_id} belongs to another batch config: {run['manifest_path']}"
+                )
+            if str(run["status"]) not in {"paused", "failed", "interrupted"}:
+                raise RuntimeError(
+                    f"run is not retryable: {self.selected_run_id} (status={run['status']})"
+                )
+            store.mark_run_task_retry(self.selected_run_id, args[0])
+        finally:
+            store.close()
+        await self.command_run(["--resume", self.selected_run_id, "--only", args[0], "--retry-failed"])
+
+    async def command_rerun(self, args: list[str]) -> None:
+        if len(args) != 1:
+            raise RuntimeError("Usage: /rerun <task-id>")
+        await self.command_run(["--only", args[0]])
+
+    async def command_harness(self, args: list[str]) -> None:
+        if not args:
+            self.set_detail(
+                [
+                    f"Current harness: {self.harness_name}",
+                    "Available: " + ", ".join(available_harnesses()),
+                    "Use /harness doctor <name> before /harness use <name>.",
+                    "The selected harness is frozen into each new Run.",
+                ]
+            )
+            return
+        action = args[0].lower()
+        if action in available_harnesses() and len(args) == 1:
+            action, args = "use", ["use", action]
+        if action == "reset":
+            if len(args) != 1:
+                raise RuntimeError("Usage: /harness reset")
+            self.harness_name = "native"
+            self._save_preferences({"harness": "native"})
+            self.notify("harness reset to native")
+            self.render_page()
+            return
+        if action not in {"use", "doctor"} or len(args) != 2:
+            raise RuntimeError("Usage: /harness [use|doctor] <native|opencode|claude> | /harness reset")
+        name = args[1].lower()
+        if name not in available_harnesses():
+            raise RuntimeError(f"unknown harness: {name}")
+        probe = await probe_harness(name)
+        if action == "doctor":
+            severity = "information" if probe.available else "warning"
+            self.notify(
+                f"{name}: {'available' if probe.available else 'unavailable'}: {probe.version or probe.error}",
+                severity=severity,
+            )
+            return
+        if not probe.available:
+            raise RuntimeError(f"harness {name} is unavailable: {probe.error}")
+        self.harness_name = name
+        self._save_preferences({"harness": name})
+        self.notify(f"harness set to {name}; applies to the next Run")
         self.render_page()
 
-    def command_rerun(self, args: list[str]) -> None:
+    def command_theme(self, args: list[str]) -> None:
         if not args:
-            raise RuntimeError("Usage: /rerun <task-id>")
-        manifest = self.require_manifest()
-        changed = rerun_tasks(manifest.path, set(args))
-        self.load_manifest(manifest.path)
-        self.notify(f"reset {changed} task(s)")
-        self.page = "batch"
-        self.render_page()
+            self.set_detail(
+                [
+                    f"Current theme: {self.theme}",
+                    "Available: " + ", ".join(sorted(self.available_themes)),
+                    "Use /theme <name>. Changes are saved in ~/.bagent/settings.json.",
+                ]
+            )
+            return
+        if len(args) != 1 or args[0] not in self.available_themes:
+            raise RuntimeError("Usage: /theme <" + "|".join(sorted(self.available_themes)) + ">")
+        self.theme = args[0]
+        self._save_preferences({"theme": self.theme})
+        self.notify(f"theme saved: {self.theme}")
 
     async def collect_run_vars(self, manifest: Manifest, initial: dict[str, str]) -> dict[str, str] | None:
         if not manifest.config.run_variables:
@@ -969,11 +1363,17 @@ class BatchAgentTui(App[None]):
         self.push_screen(RunVariablesScreen(manifest.config.run_variables, initial), callback=callback)
         return await future
 
-    def parse_run_args(self, args: list[str]) -> tuple[str | None, str | None, bool, dict[str, str]]:
+    def parse_run_args(
+        self, args: list[str]
+    ) -> tuple[str | None, set[str] | None, bool, dict[str, str], int | None, str, str | None, str]:
         token: str | None = None
-        only: str | None = None
+        only: set[str] = set()
         retry_failed = False
         run_vars: dict[str, str] = {}
+        limit: int | None = None
+        focus = ""
+        harness: str | None = None
+        resume_id = ""
         index = 0
         while index < len(args):
             arg = args[index]
@@ -981,9 +1381,41 @@ class BatchAgentTui(App[None]):
                 index += 1
                 if index >= len(args):
                     raise RuntimeError("--only requires a task id")
-                only = args[index]
+                only.add(args[index])
             elif arg == "--retry-failed":
                 retry_failed = True
+            elif arg == "--limit":
+                index += 1
+                if index >= len(args):
+                    raise RuntimeError("--limit requires a number")
+                limit = self.parse_limit_arg(args[index])
+            elif arg.startswith("--limit="):
+                limit = self.parse_limit_arg(arg.removeprefix("--limit="))
+            elif arg == "--focus":
+                index += 1
+                if index >= len(args):
+                    raise RuntimeError("--focus requires a task id")
+                focus = args[index]
+            elif arg.startswith("--focus="):
+                focus = arg.removeprefix("--focus=")
+            elif arg == "--harness":
+                index += 1
+                if index >= len(args):
+                    raise RuntimeError("--harness requires a name")
+                harness = args[index].lower()
+                if harness not in available_harnesses():
+                    raise RuntimeError(f"unknown harness: {harness}")
+            elif arg.startswith("--harness="):
+                harness = arg.removeprefix("--harness=").lower()
+                if harness not in available_harnesses():
+                    raise RuntimeError(f"unknown harness: {harness}")
+            elif arg == "--resume":
+                index += 1
+                if index >= len(args):
+                    raise RuntimeError("--resume requires a run id")
+                resume_id = args[index]
+            elif arg.startswith("--resume="):
+                resume_id = arg.removeprefix("--resume=")
             elif arg == "--var":
                 index += 1
                 if index >= len(args):
@@ -998,7 +1430,16 @@ class BatchAgentTui(App[None]):
             else:
                 raise RuntimeError(f"unexpected argument: {arg}")
             index += 1
-        return token, only, retry_failed, run_vars
+        return token, only or None, retry_failed, run_vars, limit, focus, harness, resume_id
+
+    def parse_limit_arg(self, value: str) -> int:
+        try:
+            limit = int(value)
+        except ValueError as exc:
+            raise RuntimeError(f"--limit must be an integer: {value}") from exc
+        if limit < 0:
+            raise RuntimeError("--limit must be non-negative")
+        return limit
 
     def parse_var_arg(self, value: str) -> tuple[str, str]:
         if "=" not in value:
@@ -1019,26 +1460,64 @@ class BatchAgentTui(App[None]):
         if self.progress_state is None:
             return
         self.progress_state.handle_event(event)
-        work_id = str(event.get("work_id") or "")
-        if work_id:
-            self.current_work_id = work_id
+        run_id = str(event.get("run_id") or event.get("work_id") or "")
+        if run_id:
+            self.current_work_id = run_id
+            self.active_run_id = run_id
+            self.selected_run_id = run_id
         task_id = str(event.get("task_id") or "")
         if task_id and not self.focus_task_id:
             self.focus_task_id = task_id
             self.progress_state.focus_task_id = task_id
-        self.render_page()
+        self._run_render_dirty = True
+
+    def flush_run_render(self) -> None:
+        if self.page != "run":
+            return
+        if self.run_task and not self.run_task.done():
+            self.render_run()
+            self._run_render_dirty = False
+            return
+        if self._run_render_dirty:
+            self.render_run()
+            self._run_render_dirty = False
 
     def finish_run(self, task: asyncio.Task) -> None:
+        run_id = self.active_run_id or self.selected_run_id
+        execution_error: Exception | None = None
         try:
             self.run_results = task.result()
-            failed = [result for result in self.run_results if not result.success]
-            if failed:
-                self.notify(f"batch finished with {len(failed)} failed task(s)", severity="warning")
-            else:
-                self.notify(f"batch completed: {len(self.run_results)} task(s)")
         except Exception as exc:
-            self.notify(f"batch failed: {exc}", severity="error")
+            self.run_results = []
+            execution_error = exc
+
+        notified = False
+        if run_id:
+            try:
+                run, tasks = self.persisted_run_snapshot(run_id)
+            except RuntimeError:
+                pass
+            else:
+                message, severity = _run_status_feedback(run, tasks)
+                if execution_error is not None and str(execution_error) not in message:
+                    message = f"{message} Error: {execution_error}"
+                self.notify(message, severity=severity)
+                notified = True
+        if not notified:
+            if execution_error is not None:
+                self.notify(f"Run failed: {execution_error}", severity="error")
+            else:
+                failed = [result for result in self.run_results if not result.success]
+                if failed:
+                    self.notify(f"Run finished with {len(failed)} failed Task(s).", severity="warning")
+                else:
+                    self.notify(f"Run completed: {len(self.run_results)} Task(s).")
+        self.pause_event = None
+        self.active_run_id = ""
+        self.active_manifest_path = None
         self.refresh_current()
+        if self.exit_after_pause:
+            self.exit()
 
     def refresh_current(self) -> None:
         if self.selected_manifest_path:
@@ -1057,10 +1536,14 @@ class BatchAgentTui(App[None]):
         raise RuntimeError(f"manifest path not found: {token}")
 
     def load_manifest(self, path: Path) -> None:
+        previous_path = self.selected_manifest_path.resolve() if self.selected_manifest_path else None
         manifest = load_manifest(path)
         validate_manifest(manifest)
         self.selected_manifest = manifest
         self.selected_manifest_path = manifest.path
+        if previous_path is not None and previous_path != manifest.path.resolve():
+            self.selected_run_id = ""
+            self.progress_state = None
         task_ids = {task.id for task in manifest.tasks}
         if manifest.tasks and self.focus_task_id not in task_ids:
             self.focus_task_id = manifest.tasks[0].id
@@ -1088,10 +1571,15 @@ class BatchAgentTui(App[None]):
             return None
         return self.progress_state.tasks.get(task_id)
 
-    def task_detail_text_for(self, task_id: str) -> str:
+    def task_detail_text_for(self, task_id: str, run_id: str = "", attempt_id: str = "") -> str:
         task = self.task_progress_for(task_id)
-        if task is not None:
-            return self.task_progress_text(task, full=True)
+        selected_run = run_id or self.selected_run_id or self.active_run_id
+        if task is not None and selected_run == self.active_run_id and self.run_task and not self.run_task.done():
+            live = self.task_progress_text(task, full=True)
+            persisted = self.persisted_task_output_lines(task_id, selected_run, attempt_id)
+            return console_safe(live + "\n\n" + "\n".join(persisted))
+        if selected_run:
+            return console_safe("\n".join(self.persisted_task_output_lines(task_id, selected_run, attempt_id)))
         manifest = self.require_manifest()
         row = next((item for item in manifest.tasks if item.id == task_id), None)
         if row is None:
@@ -1102,6 +1590,9 @@ class BatchAgentTui(App[None]):
         base = [
             f"status: {task.status}",
             f"attempts: {task.attempts}",
+            f"run_id: {task.run_id or self.active_run_id}",
+            f"attempt_id: {task.attempt_id}",
+            f"total_tokens: {task.total_tokens if task.total_tokens is not None else ''}",
             f"run_dir: {task.run_dir}",
             f"artifact: {task.artifact_path}",
             f"result: {task.result}",
@@ -1127,32 +1618,91 @@ class BatchAgentTui(App[None]):
             lines.extend(["", *self.persisted_task_output_lines(task.id)])
         return console_safe("\n".join(lines))
 
-    def persisted_task_output_lines(self, task_id: str) -> list[str]:
+    def persisted_task_output_lines(
+        self,
+        task_id: str,
+        run_id: str = "",
+        attempt_id: str = "",
+    ) -> list[str]:
         manifest = self.require_manifest()
         db_path = state_db_path(manifest)
         if not db_path.exists():
-            return ["persisted run output:", "(no state database yet)"]
+            return ["persisted output:", "(no state database yet)"]
         store = SessionStore(db_path)
         try:
-            runs = store.task_runs(task_id)
-            if not runs:
-                return ["persisted run output:", "(no persisted runs for this task yet)"]
-            run = runs[0]
-            run_id = run["run_id"]
+            selected_run = run_id
+            if not selected_run:
+                runs = store.batch_runs(manifest.path)
+                selected_run = next(
+                    (
+                        str(row["run_id"])
+                        for row in runs
+                        if store.run_task(str(row["run_id"]), task_id) is not None
+                    ),
+                    "",
+                )
+            if not selected_run:
+                return ["persisted output:", "(no persisted Run for this Task yet)"]
+            run = store.batch_run(selected_run)
+            run_task = store.run_task(selected_run, task_id)
+            if run is None or run_task is None:
+                return ["persisted output:", f"(Task {task_id} is not part of Run {selected_run})"]
+            attempts = store.task_attempts(selected_run, task_id)
             lines = [
-                "latest persisted run:",
-                f"run_id: {run_id}",
-                f"attempt: {run['attempt']}",
-                f"status: {run['status']}",
-                f"run_dir: {run['run_dir']}",
-                f"started_at: {run['started_at']}",
-                f"finished_at: {run['finished_at'] or ''}",
-                f"error: {run['error']}",
+                "Run / Task:",
+                f"run_id: {selected_run}",
+                f"run_status: {run['status']}",
+                f"task_id: {task_id}",
+                f"task_status: {run_task['status']}",
+                f"attempt_count: {run_task['attempt_count']}",
+                f"elapsed: {_format_seconds(float(run_task.get('elapsed_seconds') or 0))}",
+                f"total_tokens: {run_task.get('total_tokens') if run_task.get('total_tokens') is not None else ''}",
+                f"result: {json.dumps(run_task.get('result') or {}, ensure_ascii=False)}",
+                f"error: {run_task.get('error') or ''}",
+                "",
+                "Attempts (newest first):",
             ]
-            artifacts = store.run_artifacts(run_id)
+            if not attempts:
+                lines.append("(no Attempts yet)")
+                return lines
+            for row in attempts:
+                lines.append(
+                    "  {attempt_id}  #{attempt_no}  {status}  {harness}  {elapsed}  tokens={tokens}".format(
+                        attempt_id=row["attempt_id"],
+                        attempt_no=row["attempt_no"],
+                        status=row["status"],
+                        harness=row["harness"],
+                        elapsed=_format_seconds(float(row.get("elapsed_seconds") or 0)),
+                        tokens=row.get("total_tokens") if row.get("total_tokens") is not None else "-",
+                    )
+                )
+            chosen = next((row for row in attempts if row["attempt_id"] == attempt_id), None) if attempt_id else attempts[0]
+            if chosen is None:
+                lines.extend(["", f"Attempt not found: {attempt_id}"])
+                return lines
+            selected_attempt = str(chosen["attempt_id"])
+            lines.extend(
+                [
+                    "",
+                    "Selected Attempt:",
+                    f"attempt_id: {selected_attempt}",
+                    f"attempt_no: {chosen['attempt_no']}",
+                    f"status: {chosen['status']}",
+                    f"harness: {chosen['harness']} {chosen.get('harness_version') or ''}",
+                    f"external_session_id: {chosen.get('external_session_id') or ''}",
+                    f"run_dir: {chosen['run_dir']}",
+                    f"started_at: {chosen['started_at']}",
+                    f"finished_at: {chosen.get('finished_at') or ''}",
+                    f"elapsed: {_format_seconds(float(chosen.get('elapsed_seconds') or 0))}",
+                    f"usage: {json.dumps(chosen.get('usage') or {}, ensure_ascii=False)}",
+                    f"result: {json.dumps(chosen.get('result') or {}, ensure_ascii=False)}",
+                    f"error: {chosen.get('error') or ''}",
+                ]
+            )
+            artifacts = store.run_artifacts(selected_attempt)
             if artifacts:
                 lines.extend(["", "artifacts:", json.dumps(artifacts, ensure_ascii=False, indent=2)])
-            tool_events = store.run_tool_events(run_id, limit=20)
+            tool_events = store.run_tool_events(selected_attempt, limit=20)
             if tool_events:
                 lines.append("")
                 lines.append("tool events:")
@@ -1160,8 +1710,15 @@ class BatchAgentTui(App[None]):
                     error = f" error={event['error']}" if event["error"] else ""
                     lines.append(f"  #{event['seq']} {event['tool_name']}{error}")
                     lines.append(f"    args: {truncate(json.dumps(event['arguments'], ensure_ascii=False), 500)}")
-            messages = store.run_messages(run_id, limit=20)
-            assistant_or_tool = [message for message in messages if message["role"] in {"assistant", "tool"}]
+            model_calls = store.model_calls(selected_attempt)
+            if model_calls:
+                lines.extend(["", "model calls:", json.dumps(model_calls, ensure_ascii=False, indent=2)])
+            messages = store.run_messages(selected_attempt, limit=20)
+            assistant_or_tool = [
+                message
+                for message in messages
+                if message["role"] in {"assistant", "tool", "harness", "harness-stderr"}
+            ]
             lines.extend(["", "agent output:"])
             if not assistant_or_tool:
                 lines.append("(no assistant/tool messages persisted)")
@@ -1174,9 +1731,77 @@ class BatchAgentTui(App[None]):
             store.close()
 
 
-def run_tui(start_manifest: str | None = None) -> int:
+def _manifest_with_frozen_run_tasks(manifest: Manifest, rows: list[dict[str, Any]]) -> Manifest:
+    tasks: list[Task] = []
+    for row in rows:
+        definition = dict(row.get("definition") or {})
+        result = row.get("result") or {}
+        if isinstance(result, dict):
+            result_text = str(result.get("artifact_path") or result.get("output") or "")
+            if not result_text and result:
+                result_text = json.dumps(result, ensure_ascii=False)
+        else:
+            result_text = str(result)
+        tasks.append(
+            Task(
+                status=str(row.get("status") or "queued"),
+                id=str(row["task_id"]),
+                kind=str(definition.get("kind") or row.get("kind") or ""),
+                input=dict(definition.get("input") or row.get("input") or {}),
+                result=result_text,
+                attempts=int(row.get("attempt_count") or 0),
+                error=str(row.get("error") or ""),
+                lease=str(row.get("latest_attempt_id") or ""),
+            )
+        )
+    return Manifest(
+        path=manifest.path,
+        text=manifest.text,
+        config=manifest.config,
+        tasks=tasks,
+        tasks_start=manifest.tasks_start,
+        tasks_end=manifest.tasks_end,
+    )
+
+
+def _run_status_feedback(run: dict[str, Any], tasks: list[dict[str, Any]]) -> tuple[str, str]:
+    run_id = str(run["run_id"])
+    status = str(run["status"])
+    counts: dict[str, int] = {}
+    for task in tasks:
+        task_status = str(task["status"])
+        counts[task_status] = counts.get(task_status, 0) + 1
+    unfinished = sum(
+        counts.get(item, 0)
+        for item in {"queued", "retry", "interrupted", "running", "todo", "needs-review"}
+    )
+    failed = counts.get("failed", 0)
+    done = counts.get("done", 0)
+    if status == "completed":
+        return f"Run {run_id} completed: {done} Task(s) done.", "information"
+    if status in {"paused", "interrupted", "queued"}:
+        queued = counts.get("queued", 0)
+        return (
+            f"Run {run_id} {status}: {unfinished} unfinished Task(s), {queued} queued. "
+            f"Resume with /resume {run_id}.",
+            "warning",
+        )
+    if status == "failed":
+        if unfinished:
+            next_action = f" Resume unfinished work with /resume {run_id}."
+        elif failed:
+            next_action = f" Select a failed Task, then use /retry <task-id> in Run {run_id}."
+        else:
+            next_action = ""
+        return f"Run {run_id} failed: {failed} failed, {unfinished} unfinished Task(s).{next_action}", "error"
+    if status == "running":
+        return f"Run {run_id} is still active.", "information"
+    return f"Run {run_id} finished with status {status}.", "warning"
+
+
+def run_tui(start_manifest: str | None = None, auto_run_args: list[str] | None = None) -> int:
     try:
-        BatchAgentTui(start_manifest=start_manifest).run()
+        BatchAgentTui(start_manifest=start_manifest, auto_run_args=auto_run_args).run()
         return 0
     except (ManifestError, RuntimeError) as exc:
         print(f"error: {exc}")

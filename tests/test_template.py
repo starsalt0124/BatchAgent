@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+from pathlib import Path
 
 from batchagent.models import BatchConfig, Task
 from batchagent.template import render_template
@@ -24,6 +26,22 @@ class TemplateTests(unittest.TestCase):
         config = BatchConfig(run_vars={"market": "A股", "date": "2026-06-06"})
         result = render_template("market={{vars.market}} date={{run_vars.date}}", task, config)
         self.assertEqual(result, "market=A股 date=2026-06-06")
+
+
+    def test_renders_workspace_file_token_from_task_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ctx").mkdir()
+            (root / "ctx" / "task.json").write_text('{"ok": true}', encoding="utf-8")
+            task = Task(status="todo", id="abc", input={"prompt_context_path": "ctx/task.json"})
+            config = BatchConfig(workspace=str(root))
+            result = render_template(
+                "context={{file:task.input.prompt_context_path}}",
+                task,
+                config,
+                workspace=root,
+            )
+            self.assertEqual(result, 'context={"ok": true}')
 
 
 if __name__ == "__main__":
