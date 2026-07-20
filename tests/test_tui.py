@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from textual.widgets import DataTable, Input
 
+from batchagent import __version__
 from batchagent.harness import HarnessProbe
 from batchagent.manifest import create_sample_manifest, load_manifest
 from batchagent.progress import ProgressState
@@ -21,6 +22,11 @@ from batchagent.tui import BatchAgentTui, RunVariablesScreen, TaskDetailScreen
 
 
 class TuiTests(unittest.TestCase):
+    def test_tui_header_exposes_current_version(self) -> None:
+        app = BatchAgentTui()
+        self.assertEqual(app.title, "BatchAgent")
+        self.assertEqual(app.sub_title, f"v{__version__}")
+
     def test_completion_candidates_include_commands_manifests_and_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             previous = Path.cwd()

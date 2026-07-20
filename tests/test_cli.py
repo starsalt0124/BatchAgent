@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from batchagent import __version__
 from batchagent.cli import _auto_run_args, main
 from batchagent.manifest import create_sample_manifest, load_manifest
 from batchagent.scheduler import state_db_path
@@ -18,6 +19,13 @@ from batchagent.store import SessionStore
 
 
 class CliTests(unittest.TestCase):
+    def test_version_reports_installed_package_version(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+            main(["--version"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(output.getvalue().strip(), f"bagent {__version__}")
+
     def test_help_uses_bagent_as_primary_command_name(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as raised:

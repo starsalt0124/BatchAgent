@@ -25,6 +25,14 @@ Python 3.11+ is required. Package installation installs the Rich and Textual dep
 
 `bagent` is the primary command-line executable. The legacy `batchagent` executable remains available as a compatibility alias; the Python package name remains `batchagent`.
 
+Use `bagent --version` to verify the installed CLI. The TUI displays the same version in its always-visible Header.
+
+For a source checkout, use an editable install so the console entry point always loads the current working tree:
+
+```bash
+uv pip install --python .venv/bin/python --editable .
+```
+
 ```powershell
 bagent --help
 ```

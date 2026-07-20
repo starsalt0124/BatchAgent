@@ -16,6 +16,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
+from . import __version__
 from .harness import (
     HarnessError,
     HarnessProbe,
@@ -241,6 +242,9 @@ class RunVariablesScreen(ModalScreen[dict[str, str] | None]):
 
 
 class BatchAgentTui(App[None]):
+    TITLE = "BatchAgent"
+    SUB_TITLE = f"v{__version__}"
+
     CSS = """
     Screen {
         layout: vertical;
@@ -488,7 +492,7 @@ class BatchAgentTui(App[None]):
                         "Type / for commands; Tab completes the current token.",
                     ]
                 ),
-                title="BatchAgent",
+                title=f"BatchAgent v{__version__}",
             )
         )
         table = self.query_one("#table", DataTable)

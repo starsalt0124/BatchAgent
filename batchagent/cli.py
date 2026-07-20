@@ -6,6 +6,7 @@ import json
 import sys
 from pathlib import Path
 
+from . import __version__
 from .harness import (
     HarnessError,
     canonical_harness_name,
@@ -53,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_tui()
 
     parser = argparse.ArgumentParser(prog=CLI_NAME, description="Markdown-driven batch agent harness.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     tui_parser = subparsers.add_parser("tui", help="Start the full-screen interactive TUI.")
