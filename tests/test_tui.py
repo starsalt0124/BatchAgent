@@ -4,10 +4,11 @@ import asyncio
 import contextlib
 import os
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from textual.widgets import DataTable, Input
 
@@ -18,7 +19,7 @@ from batchagent.progress import ProgressState
 from batchagent.scheduler import state_db_path
 from batchagent.settings import load_settings
 from batchagent.store import SessionStore
-from batchagent.tui import BatchAgentTui, RunVariablesScreen, TaskDetailScreen
+from batchagent.tui import COMMANDS, BatchAgentTui, RunVariablesScreen, TaskDetailScreen
 
 
 class TuiTests(unittest.TestCase):
@@ -48,6 +49,37 @@ class TuiTests(unittest.TestCase):
                 self.assertIn("built-in", app.completion_candidates("/harness use b"))
                 self.assertIn("claudecode", app.completion_candidates("/harness use c"))
                 self.assertIn("codex", app.completion_candidates("/run --harness c"))
+                self.assertIn("/add", app.completion_candidates("/a"))
+                self.assertIn("/try", app.completion_candidates("/tr"))
+            finally:
+                os.chdir(previous)
+
+    def test_add_persists_arbitrary_manifest_outside_filename_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            home = Path(tmp) / "home"
+            try:
+                os.chdir(tmp)
+                custom = Path("PCAT-Bench-220-BATCHAGENT.md")
+                create_sample_manifest(custom)
+                with patch.dict(os.environ, {"BAGENT_HOME": str(home)}):
+                    async def add_and_restart() -> None:
+                        app = BatchAgentTui()
+                        async with app.run_test(size=(100, 30)):
+                            self.assertNotIn(custom.resolve(), app.manifest_paths)
+                            await app.handle_command(f"/add {custom}")
+                            self.assertIn(custom.resolve(), app.manifest_paths)
+                            self.assertEqual(app.selected_manifest_path, custom.resolve())
+                            self.assertEqual(load_settings()["batch_configs"], [str(custom.resolve())])
+                            await app.handle_command("/quit")
+
+                        restarted = BatchAgentTui()
+                        async with restarted.run_test(size=(100, 30)):
+                            self.assertIn(custom.resolve(), restarted.manifest_paths)
+                            self.assertIn(custom.name, restarted.completion_candidates("/show_batch PCAT"))
+                            await restarted.handle_command("/quit")
+
+                    asyncio.run(add_and_restart())
             finally:
                 os.chdir(previous)
 
@@ -139,7 +171,52 @@ class TuiTests(unittest.TestCase):
         lines = app.command_palette_lines("/")
         self.assertTrue(any("/history [run-id]" in line for line in lines))
         self.assertTrue(any("/run [manifest-path]" in line for line in lines))
-        self.assertTrue(any("/show_run <run-id>" in line for line in lines))
+        self.assertTrue(any("showing 1-8" in line for line in lines))
+
+    def test_command_palette_window_follows_selected_candidate(self) -> None:
+        app = BatchAgentTui()
+        app.command_palette_lines("/")
+        app._completion_index = 10
+        lines = app.command_palette_lines("/")
+
+        selected = [line for line in lines if line.startswith("> ")]
+        self.assertEqual(len(selected), 1)
+        self.assertIn(COMMANDS[10], selected[0])
+        self.assertTrue(any(f"of {len(COMMANDS)}" in line for line in lines))
+        self.assertFalse(any(COMMANDS[0] in line for line in lines))
+
+    def test_task_palette_reuses_candidates_and_does_not_query_runs_per_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "BATCHAGENT.md"
+            create_sample_manifest(path)
+            app = BatchAgentTui(path)
+            app.selected_manifest = load_manifest(path)
+            app.selected_manifest_path = path
+
+            with patch.object(app, "completion_candidates", wraps=app.completion_candidates) as compute:
+                with patch.object(
+                    app,
+                    "run_completion_tokens",
+                    side_effect=AssertionError("task descriptions must not query Runs"),
+                ):
+                    first = app.command_palette_lines("/show_task ")
+                    second = app.command_palette_lines("/show_task ")
+
+            self.assertEqual(first, second)
+            compute.assert_called_once_with("/show_task ")
+
+    def test_live_render_is_throttled_until_dirty_or_clock_tick(self) -> None:
+        app = BatchAgentTui()
+        app.page = "run"
+        app.run_task = SimpleNamespace(done=lambda: False)
+        app._last_run_render_at = time.monotonic()
+
+        with patch.object(app, "render_run") as render:
+            app.flush_run_render()
+            render.assert_not_called()
+            app._run_render_dirty = True
+            app.flush_run_render()
+            render.assert_called_once_with()
 
     def test_command_split_preserves_windows_paths_and_quoted_values(self) -> None:
         app = BatchAgentTui()
@@ -212,6 +289,112 @@ class TuiTests(unittest.TestCase):
                         await app.handle_command("/quit")
 
                 asyncio.run(run())
+            finally:
+                os.chdir(previous)
+
+    def test_switching_batches_preserves_active_run_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            try:
+                os.chdir(tmp)
+                first_path = Path("first") / "BATCHAGENT.md"
+                second_path = Path("second") / "BATCHAGENT.md"
+                first_path.parent.mkdir()
+                second_path.parent.mkdir()
+                create_sample_manifest(first_path)
+                create_sample_manifest(second_path)
+
+                async def run() -> None:
+                    app = BatchAgentTui(str(first_path))
+                    async with app.run_test(size=(100, 30)):
+                        state = ProgressState.from_manifest(app.require_manifest(), focus_task_id="demo-1")
+                        state.tasks["demo-1"].status = "done"
+                        app.progress_state = state
+                        app.active_run_id = "run-active"
+                        app.selected_run_id = "run-active"
+                        app.active_manifest_path = first_path.resolve()
+                        app.run_task = asyncio.create_task(asyncio.sleep(30))
+
+                        app.load_manifest(second_path)
+                        self.assertIs(app.progress_state, state)
+                        self.assertEqual(app.selected_run_id, "")
+
+                        app.handle_progress_event(
+                            {
+                                "type": "task_done",
+                                "task_id": "demo-2",
+                                "run_id": "run-active",
+                                "attempt": 1,
+                            }
+                        )
+                        self.assertEqual(app.selected_run_id, "")
+                        self.assertEqual(state.tasks["demo-2"].status, "done")
+
+                        app.load_manifest(first_path)
+                        self.assertIs(app.progress_state, state)
+                        app.selected_run_id = "run-active"
+                        app.page = "run"
+                        app.render_page()
+                        table = app.query_one("#table", DataTable)
+                        self.assertEqual(str(table.get_cell("task:demo-1", "status")), "done")
+                        self.assertEqual(str(table.get_cell("task:demo-2", "status")), "done")
+
+                        app.run_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await app.run_task
+                        await app.handle_command("/quit")
+
+                asyncio.run(run())
+            finally:
+                os.chdir(previous)
+
+    def test_active_run_without_live_state_uses_persisted_task_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            home = Path(tmp) / "home"
+            try:
+                os.chdir(tmp)
+                path = Path("BATCHAGENT.md")
+                create_sample_manifest(path)
+                with patch.dict(os.environ, {"BAGENT_HOME": str(home)}):
+                    manifest = load_manifest(path)
+                    store = SessionStore(state_db_path(manifest))
+                    try:
+                        store.start_batch_run(
+                            "run-active",
+                            manifest.path,
+                            manifest.config.name,
+                            manifest.tasks,
+                            selected_task_ids=["demo-1", "demo-2"],
+                        )
+                        store.start_attempt("attempt-done", "run-active", "demo-1", 1, Path(tmp) / "attempt-done")
+                        store.finish_attempt("attempt-done", "done")
+                    finally:
+                        store.close()
+
+                    async def run() -> None:
+                        app = BatchAgentTui(str(path))
+                        async with app.run_test(size=(100, 30)):
+                            app.progress_state = None
+                            app.active_run_id = "run-active"
+                            app.selected_run_id = "run-active"
+                            app.active_manifest_path = path.resolve()
+                            app.run_task = asyncio.create_task(asyncio.sleep(30))
+                            app.page = "run"
+                            app.render_page()
+
+                            table = app.query_one("#table", DataTable)
+                            done_row = table.get_row("run-task:run-active:demo-1")
+                            queued_row = table.get_row("run-task:run-active:demo-2")
+                            self.assertEqual(str(done_row[0]), "done")
+                            self.assertEqual(str(queued_row[0]), "queued")
+
+                            app.run_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await app.run_task
+                            await app.handle_command("/quit")
+
+                    asyncio.run(run())
             finally:
                 os.chdir(previous)
 
@@ -570,6 +753,39 @@ class TuiTests(unittest.TestCase):
                             await pilot.pause()
                             self.assertEqual(call["harness"], "codex")
                             self.assertEqual(app.page, "batch")
+                            await app.handle_command("/quit")
+
+                    asyncio.run(run())
+            finally:
+                os.chdir(previous)
+
+    def test_try_passes_pause_after_and_resume_uses_selected_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            call: dict[str, object] = {}
+
+            async def fake_run_manifest(*_args, **kwargs):
+                call.update(kwargs)
+                return []
+
+            try:
+                os.chdir(tmp)
+                create_sample_manifest("BATCHAGENT.md")
+                with patch("batchagent.tui.run_manifest", new=fake_run_manifest):
+                    async def run() -> None:
+                        app = BatchAgentTui("BATCHAGENT.md")
+                        async with app.run_test(size=(100, 30)) as pilot:
+                            await app.command_try(["1"])
+                            assert app.run_task is not None
+                            await app.run_task
+                            await pilot.pause()
+                            self.assertEqual(call["pause_after"], 1)
+
+                            app.selected_run_id = "run-paused"
+                            resume = AsyncMock()
+                            with patch.object(app, "command_run", new=resume):
+                                await app.command_resume([])
+                            resume.assert_awaited_once_with(["--resume", "run-paused"])
                             await app.handle_command("/quit")
 
                     asyncio.run(run())

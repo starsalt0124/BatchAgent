@@ -70,6 +70,7 @@ class BatchConfig:
     thinking: str = ""
     system_prompt: str = ""
     user_prompt_template: str = ""
+    inject_batchagent_protocol: bool = True
     run_variables: list[RunVariable] = field(default_factory=list)
     run_vars: dict[str, Any] = field(default_factory=dict)
     memory_files: list[str] = field(default_factory=list)

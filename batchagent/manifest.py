@@ -167,6 +167,7 @@ def _parse_config(text: str) -> BatchConfig:
         thinking=str(raw.get("thinking", "")),
         system_prompt=str(raw.get("system_prompt", "")),
         user_prompt_template=str(raw.get("user_prompt_template", "")),
+        inject_batchagent_protocol=bool(raw.get("inject_batchagent_protocol", True)),
         run_variables=_parse_run_variables(raw.get("run_variables", [])),
         memory_files=list(raw.get("memory_files", [])),
         skills=list(raw.get("skills", [])),

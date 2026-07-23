@@ -246,7 +246,7 @@ async def run_agent_task(
 
 def _initial_messages(config: BatchConfig, task: Task, store: SessionStore, workspace: Path, manifest_path: Path) -> list[dict[str, Any]]:
     system = render_template(config.system_prompt, task, config, workspace=workspace).strip()
-    protocol = _protocol_prompt(config)
+    protocol = _protocol_prompt(config) if config.inject_batchagent_protocol else ""
     skills = render_skills_prompt(config, manifest_path)
     memory = _memory_prompt(config, task, store, workspace, manifest_path)
     user = render_template(config.user_prompt_template, task, config, workspace=workspace).strip()
@@ -268,6 +268,8 @@ def build_task_prompt(
     messages = _initial_messages(config, task, store, workspace, manifest_path)
     system = str(messages[0].get("content") or "") if messages else ""
     user = str(messages[1].get("content") or "") if len(messages) > 1 else ""
+    if not system:
+        return user
     sections = []
     if system:
         sections.append("System instructions:\n" + system)

@@ -7,16 +7,18 @@ The current implementation is a single-process runner with a full-screen Textual
 - `bagent` starts a persistent full-screen TUI.
 - `bagent tui <manifest>` starts the same TUI with a selected manifest.
 - `bagent run <manifest>` opens the TUI with the manifest selected and starts `/run` automatically.
-- The bottom command input accepts `/show_batch`, `/show_run`, `/run`, `/resume`, `/show_task`, `/history`, `/retry`, `/rerun`, `/harness`, `/theme`, `/refresh`, and `/quit`.
+- The bottom command input accepts `/add`, `/show_batch`, `/show_run`, `/run`, `/try`, `/resume`, `/show_task`, `/history`, `/retry`, `/rerun`, `/harness`, `/theme`, `/refresh`, and `/quit`.
 - Typing `/` opens command candidates with usage examples and descriptions.
-- `Up` / `Down` selects a command candidate and `Tab` accepts it.
+- `Up` / `Down` selects a command candidate, the visible candidate window follows the selection, and `Tab` accepts it.
 - Completion covers commands, manifest paths, Run ids, Task ids, harness names, themes, and options in the current context.
-- The left sidebar is batch context only: discovered manifests and the current selected batch.
+- The left sidebar is batch context only: discovered or `/add`-registered manifests and the current selected batch.
 - Clicking a Batch Config first opens its Run list. Clicking a Run opens its Task list. Clicking a Task opens the same Attempt-aware detail modal as `/show_task <task-id>`.
 - The top panel repeats the selected batch so every page has explicit batch context.
 - `/show_task <task-id>` opens an independent detail modal. It lists every `attempt_id` in the selected Run and shows the chosen Attempt's timing, usage, messages, tool events, artifacts, result, and errors.
 - `Ctrl+C` is left for terminal/input copy behavior; exiting the TUI is `Ctrl+Q`, `/quit`, or `/exit`.
 - If a Batch Config declares `run_variables`, `/run` opens a runtime-variable modal before creating the Run.
+- `/add <path>` persists arbitrary valid manifest paths in user settings; automatic discovery still finds exact `BATCHAGENT.md` filenames below the current directory.
+- `/try <num>` freezes all eligible Tasks into one Run, executes a prefix, and leaves the Run paused so `/resume [run-id]` can execute the queued remainder.
 - The scheduler emits structured progress events.
 - The TUI consumes those events and renders manifest, batch, run, and task pages.
 - While a task is running, the detail field shows model deltas and tool activity.

@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from batchagent.store import SessionStore
 
@@ -70,6 +71,21 @@ def _create_legacy_database(path: Path, *, work_id: str = "old-work", attempt_id
 
 
 class SessionStoreTests(unittest.TestCase):
+    def test_read_only_store_skips_schema_initialization_and_rejects_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite3"
+            writer = SessionStore(path)
+            writer.close()
+
+            with patch.object(SessionStore, "_init_schema", side_effect=AssertionError("schema init")):
+                reader = SessionStore(path, read_only=True)
+            try:
+                self.assertEqual(reader.batch_runs("/tmp/missing.md"), [])
+                with self.assertRaises(sqlite3.OperationalError):
+                    reader.conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (99, 'now')")
+            finally:
+                reader.close()
+
     def test_all_runs_returns_persisted_run_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "state.sqlite3")

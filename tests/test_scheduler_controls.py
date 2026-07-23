@@ -259,6 +259,69 @@ class SchedulerControlsTests(unittest.TestCase):
                 finally:
                     store.close()
 
+    def test_pause_after_runs_prefix_and_resume_finishes_same_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "BATCHAGENT.md"
+            create_sample_manifest(path)
+            fake = root / "fake_harness.py"
+            fake.write_text(
+                "\n".join(
+                    [
+                        "import json, sys",
+                        "if '--version' in sys.argv:",
+                        "    print('fake-harness 1.0')",
+                        "    raise SystemExit(0)",
+                        "_prompt = sys.stdin.read()",
+                        "print(json.dumps({'type':'result','result':'ok'}))",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            text = path.read_text(encoding="utf-8").replace("retries = 1", "retries = 0")
+            text = text.replace(
+                "[artifact]\nrequire_submit = true",
+                "\n".join(
+                    [
+                        "[harness]",
+                        'name = "opencode"',
+                        f"command = [{json.dumps(sys.executable)}, {json.dumps(str(fake))}]",
+                        "inject_tools = false",
+                        "",
+                        "[artifact]",
+                        "require_submit = false",
+                    ]
+                ),
+            )
+            path.write_text(text, encoding="utf-8")
+
+            events: list[dict] = []
+            with patch.dict(os.environ, {"BAGENT_HOME": str(root / "home")}):
+                first = asyncio.run(run_manifest(path, pause_after=1, progress_callback=events.append))
+                self.assertEqual(len(first), 1)
+                self.assertTrue(first[0].success)
+                run_id = first[0].run_id
+                self.assertEqual(events[0]["eligible_tasks"], 2)
+                self.assertEqual(events[0]["scheduled_tasks"], 1)
+
+                store = SessionStore(state_db_path(load_manifest(path)))
+                try:
+                    self.assertEqual(store.batch_run(run_id)["status"], "paused")  # type: ignore[index]
+                    self.assertEqual([row["status"] for row in store.run_tasks(run_id)], ["done", "queued"])
+                finally:
+                    store.close()
+
+                resumed = asyncio.run(resume_manifest(path, run_id))
+                self.assertEqual(len(resumed), 1)
+                self.assertEqual(resumed[0].task_id, "demo-2")
+                store = SessionStore(state_db_path(load_manifest(path)))
+                try:
+                    self.assertEqual(store.batch_run(run_id)["status"], "completed")  # type: ignore[index]
+                    self.assertEqual([row["status"] for row in store.run_tasks(run_id)], ["done", "done"])
+                finally:
+                    store.close()
+
     def test_retry_failed_task_appends_attempt_inside_same_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -46,8 +46,9 @@ from .util import console_safe, truncate
 COMMAND_SPECS = [
     ("/show_batch", "/show_batch <manifest-path>", "Select a Batch Config and list its persisted Runs."),
     ("/run", "/run [manifest-path] [--only task-id] [--harness name]", "Create a new Run from the selected Batch Config."),
+    ("/try", "/try <num>", "Run the first num Tasks, then pause this Run so /resume can continue it."),
     ("/show_run", "/show_run <run-id>", "Open one Run and list its Tasks."),
-    ("/resume", "/resume <run-id>", "Resume queued or interrupted Tasks in an incomplete Run."),
+    ("/resume", "/resume [run-id]", "Resume queued or interrupted Tasks in the selected incomplete Run."),
     ("/pause", "/pause [run-id]", "Safely pause an active Run after current Attempts finish."),
     ("/show_task", "/show_task <task-id>", "Show Attempts and durable output for a Task in the selected Run."),
     ("/history", "/history [run-id]", "Alias for the current Batch's Run list or one Run."),
@@ -55,6 +56,7 @@ COMMAND_SPECS = [
     ("/rerun", "/rerun <task-id>", "Create a new Run containing the selected Task."),
     ("/harness", "/harness [use|reset|doctor] [name]", "Open the harness list or persist a selection."),
     ("/theme", "/theme [name]", "Show or persist the Textual color theme."),
+    ("/add", "/add <path-to-batch-config>", "Persist an arbitrary Batch Config path and select it."),
     ("/refresh", "/refresh", "Reload manifests and current status."),
     ("/show_home", "/show_home", "Return to the manifest list page."),
     ("/help", "/help", "Show the home/help page."),
@@ -293,7 +295,7 @@ class BatchAgentTui(App[None]):
 
     #command_palette {
         display: none;
-        max-height: 9;
+        max-height: 12;
         border-top: solid $surface;
         padding: 0 1;
     }
@@ -353,9 +355,14 @@ class BatchAgentTui(App[None]):
         self._completion_candidates: list[str] = []
         self._completion_index = 0
         self._completion_input = ""
+        self._run_completion_cache_key = ""
+        self._run_completion_cache: list[str] = []
+        self._task_completion_cache_run_id = ""
+        self._task_completion_cache: list[str] = []
         self._detail_content_key = ""
         self._run_table_keys: list[str] = []
         self._run_render_dirty = False
+        self._last_run_render_at = 0.0
         self._auto_run_started = False
 
     def _watch_theme(self, theme_name: str) -> None:
@@ -410,7 +417,16 @@ class BatchAgentTui(App[None]):
             if ".batchagent" in set(path.parts) or "__pycache__" in set(path.parts):
                 continue
             candidates.append(path)
-        self.manifest_paths = sorted(candidates, key=lambda item: str(item).lower())
+        configured = self.settings.get("batch_configs")
+        if isinstance(configured, list):
+            for value in configured:
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                path = Path(value).expanduser()
+                if path.is_file():
+                    candidates.append(path)
+        unique = {str(path.resolve()): path.resolve() for path in candidates}
+        self.manifest_paths = sorted(unique.values(), key=lambda item: str(item).lower())
 
     def render_page(self) -> None:
         self.render_sidebar()
@@ -434,7 +450,7 @@ class BatchAgentTui(App[None]):
         self.notify("No focused text input to copy from.", severity="warning")
 
     def render_sidebar(self) -> None:
-        self.query_one("#side_title", Static).update("Batches\nDiscovered manifests")
+        self.query_one("#side_title", Static).update("Batches\nDiscovered + added")
         self.query_one("#selection", Static).update(self.selection_text())
         table = self.query_one("#manifest_table", DataTable)
         table.clear(columns=True)
@@ -508,7 +524,7 @@ class BatchAgentTui(App[None]):
         self.set_detail(
             [
                 "Screen areas:",
-                "  Left sidebar: discovered batch manifests and the current selected batch.",
+                "  Left sidebar: discovered and /add-registered manifests plus the current selection.",
                 "  Top panel: current page and selected batch context.",
                 "  Center table: the primary list for the current page.",
                 "  Lower detail: focused task, history, or page-specific detail.",
@@ -557,7 +573,7 @@ class BatchAgentTui(App[None]):
             [
                 "Hierarchy: Batch Config → Run → Task → Attempt",
                 "Each /run creates an immutable run_id and freezes the selected Tasks, variables, and harness.",
-                "Use /resume <run-id> for unfinished work. Use /retry <task-id> inside a selected Run.",
+                "Use /resume [run-id] for unfinished work. Use /retry <task-id> inside a selected Run.",
                 "",
                 "No Runs yet." if not rows else "Press Enter on a row or use /show_run <run-id>.",
             ]
@@ -614,7 +630,15 @@ class BatchAgentTui(App[None]):
         if not (self.run_task and not self.run_task.done() and self.selected_run_id == self.active_run_id):
             self.render_persisted_run()
             return
-        state = self.require_progress()
+        # A Batch switch must never make an active Run look fresh again. If
+        # the in-memory live state is unavailable, the persisted Run is the
+        # authoritative fallback; rebuilding from the manifest would turn
+        # every frozen task back into its definition-level status (usually
+        # ``todo``).
+        if self.progress_state is None:
+            self.render_persisted_run()
+            return
+        state = self.progress_state
         counts = state.counts()
         eta = state.eta_seconds()
         done = counts.get("done", 0)
@@ -646,6 +670,7 @@ class BatchAgentTui(App[None]):
         )
         self.render_run_table(state)
         self.render_focused_task_detail()
+        self._last_run_render_at = time.monotonic()
 
     def render_persisted_run(self) -> None:
         manifest = self.require_manifest()
@@ -662,6 +687,8 @@ class BatchAgentTui(App[None]):
             tasks = store.run_tasks(run_id)
         finally:
             store.close()
+        self._task_completion_cache_run_id = run_id
+        self._task_completion_cache = [str(row["task_id"]) for row in tasks]
         if run is None or run["manifest_path"] != str(manifest.path.resolve()):
             raise RuntimeError(f"run not found for selected batch: {run_id}")
         self.query_one("#title", Static).update(
@@ -707,18 +734,23 @@ class BatchAgentTui(App[None]):
         manifest = self.require_manifest()
         store = self.open_store_if_present()
         if store is None:
+            self._run_completion_cache_key = str(manifest.path.resolve())
+            self._run_completion_cache = []
             return []
         try:
-            return store.batch_runs(manifest.path)
+            rows = store.batch_runs(manifest.path)
         finally:
             store.close()
+        self._run_completion_cache_key = str(manifest.path.resolve())
+        self._run_completion_cache = [str(row["run_id"]) for row in rows]
+        return rows
 
-    def open_store_if_present(self) -> SessionStore | None:
+    def open_store_if_present(self, *, read_only: bool = True) -> SessionStore | None:
         manifest = self.require_manifest()
         db_path = state_db_path(manifest)
         if not db_path.exists():
             return None
-        return SessionStore(db_path)
+        return SessionStore(db_path, read_only=read_only)
 
     def persisted_run_snapshot(self, run_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         manifest = self.require_manifest()
@@ -732,7 +764,10 @@ class BatchAgentTui(App[None]):
             expected_path = str(manifest.path.resolve())
             if str(run["manifest_path"]) != expected_path:
                 raise RuntimeError(f"run {run_id} belongs to another batch config: {run['manifest_path']}")
-            return run, store.run_tasks(run_id)
+            tasks = store.run_tasks(run_id)
+            self._task_completion_cache_run_id = run_id
+            self._task_completion_cache = [str(row["task_id"]) for row in tasks]
+            return run, tasks
         finally:
             store.close()
 
@@ -838,6 +873,7 @@ class BatchAgentTui(App[None]):
         if key.startswith("run:"):
             try:
                 self.selected_run_id = key.removeprefix("run:")
+                self.reset_completion()
                 self.page = "run"
                 self.render_page()
             except Exception as exc:
@@ -871,7 +907,7 @@ class BatchAgentTui(App[None]):
         db_path = state_db_path(manifest)
         if not db_path.exists():
             return []
-        store = SessionStore(db_path)
+        store = SessionStore(db_path, read_only=True)
         try:
             if self.selected_run_id:
                 return store.task_attempts(self.selected_run_id, task_id)
@@ -921,6 +957,8 @@ class BatchAgentTui(App[None]):
         return True
 
     def refresh_completion_candidates(self, value: str, *, reset_index: bool = False) -> list[str]:
+        if not reset_index and value == self._completion_input:
+            return self._completion_candidates
         candidates = self.completion_candidates(value)
         if value != self._completion_input or candidates != self._completion_candidates or reset_index:
             self._completion_input = value
@@ -948,12 +986,17 @@ class BatchAgentTui(App[None]):
         candidates = self.refresh_completion_candidates(value)
         if not candidates:
             return ["No matching command, batch, option, or task."]
+        window_size = 8
+        max_start = max(0, len(candidates) - window_size)
+        window_start = min(max_start, max(0, self._completion_index - window_size + 1))
+        window_end = min(len(candidates), window_start + window_size)
         lines: list[str] = []
-        for index, candidate in enumerate(candidates[:8]):
+        for index in range(window_start, window_end):
+            candidate = candidates[index]
             marker = ">" if index == self._completion_index else " "
             lines.append(f"{marker} {self.describe_candidate(value, candidate)}")
-        if len(candidates) > 8:
-            lines.append(f"  ... {len(candidates) - 8} more")
+        if len(candidates) > window_size:
+            lines.append(f"  showing {window_start + 1}-{window_end} of {len(candidates)}")
         return lines
 
     def describe_candidate(self, value: str, candidate: str) -> str:
@@ -974,14 +1017,26 @@ class BatchAgentTui(App[None]):
             return f"{harness_display_name(harness_name)} - local task harness"
         if candidate in self.available_themes:
             return f"{candidate} - Textual color theme"
-        if candidate in self.run_completion_tokens():
+        before, token = self.split_completion_token(value)
+        command = self.command_name_for_completion(before, token)
+        tokens = before.strip().split()
+        if command in {"/show_run", "/resume", "/history"}:
             return f"{candidate} - persisted Run"
-        task = self.task_for_token(candidate)
-        if task is not None:
-            return f"{candidate} - task: status={task.status}, kind={task.kind or '-'}, attempts={task.attempts}"
-        manifest = self.manifest_for_token(candidate)
-        if manifest is not None:
-            return f"{candidate} - batch: {manifest.config.name} ({self.display_manifest_path(manifest.path)})"
+        task_context = command in {"/show_task", "/retry", "/rerun"} or (
+            command == "/run" and bool(tokens) and tokens[-1] in {"--only", "--focus"}
+        )
+        if task_context:
+            task = self.task_for_token(candidate)
+            if task is not None:
+                return f"{candidate} - task: status={task.status}, kind={task.kind or '-'}, attempts={task.attempts}"
+            return f"{candidate} - Task"
+        batch_context = command in {"/show_batch", "/add"} or (
+            command == "/run" and candidate in self.manifest_completion_tokens()
+        )
+        if batch_context:
+            manifest = self.manifest_for_token(candidate)
+            if manifest is not None:
+                return f"{candidate} - batch: {manifest.config.name} ({self.display_manifest_path(manifest.path)})"
         return candidate
 
     def completion_candidates(self, text: str) -> list[str]:
@@ -989,7 +1044,7 @@ class BatchAgentTui(App[None]):
         command = self.command_name_for_completion(before, token)
         if command is None:
             return self.filter_candidates(COMMANDS, token)
-        if command in {"/show_batch"}:
+        if command in {"/show_batch", "/add"}:
             return self.filter_candidates(self.manifest_completion_tokens(), token)
         if command in {"/show_run", "/resume", "/history"}:
             return self.filter_candidates(self.run_completion_tokens(), token)
@@ -1086,28 +1141,36 @@ class BatchAgentTui(App[None]):
         return [self.display_manifest_path(path) for path in self.manifest_paths]
 
     def manifest_for_token(self, token: str) -> Manifest | None:
-        matches: list[Manifest] = []
+        matches: list[Path] = []
         for path in self.manifest_paths:
-            try:
-                manifest = load_manifest(path)
-            except Exception:
-                continue
             aliases = {self.display_manifest_path(path), str(path)}
             if token in aliases:
-                matches.append(manifest)
-        return matches[0] if len(matches) == 1 else None
+                matches.append(path)
+        if len(matches) != 1:
+            return None
+        try:
+            return load_manifest(matches[0])
+        except Exception:
+            return None
 
     def task_completion_tokens(self) -> list[str]:
         manifest = self.selected_manifest
         if manifest is None:
             return []
         if self.selected_run_id:
+            if self.selected_run_id == self.active_run_id and self.progress_state is not None:
+                return [task.id for task in self.progress_state.ordered_tasks()]
+            if self._task_completion_cache_run_id == self.selected_run_id:
+                return list(self._task_completion_cache)
             store = self.open_store_if_present()
             if store is not None:
                 try:
                     rows = store.run_tasks(self.selected_run_id)
                     if rows:
-                        return [str(row["task_id"]) for row in rows]
+                        values = [str(row["task_id"]) for row in rows]
+                        self._task_completion_cache_run_id = self.selected_run_id
+                        self._task_completion_cache = values
+                        return list(values)
                 finally:
                     store.close()
         return [task.id for task in manifest.tasks]
@@ -1115,7 +1178,11 @@ class BatchAgentTui(App[None]):
     def run_completion_tokens(self) -> list[str]:
         if self.selected_manifest is None:
             return []
-        return [str(row["run_id"]) for row in self.batch_run_rows()]
+        key = str(self.selected_manifest.path.resolve())
+        if self._run_completion_cache_key == key:
+            return list(self._run_completion_cache)
+        self.batch_run_rows()
+        return list(self._run_completion_cache)
 
     def task_for_token(self, token: str) -> Task | None:
         manifest = self.selected_manifest
@@ -1159,6 +1226,8 @@ class BatchAgentTui(App[None]):
                 self.render_page()
             elif name == "/show_batch":
                 self.command_show_batch(args)
+            elif name == "/add":
+                self.command_add(args)
             elif name == "/show_run":
                 self.command_show_run(args)
             elif name == "/show_task":
@@ -1167,6 +1236,8 @@ class BatchAgentTui(App[None]):
                 self.command_history(args)
             elif name == "/run":
                 await self.command_run(args)
+            elif name == "/try":
+                await self.command_try(args)
             elif name == "/resume":
                 await self.command_resume(args)
             elif name == "/pause":
@@ -1201,6 +1272,30 @@ class BatchAgentTui(App[None]):
         self.page = "batch"
         self.render_page()
 
+    def command_add(self, args: list[str]) -> None:
+        if len(args) != 1:
+            raise RuntimeError("Usage: /add <path-to-batch-config>")
+        path = Path(args[0]).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.is_file():
+            raise RuntimeError(f"batch config not found: {args[0]}")
+        path = path.resolve()
+        manifest = load_manifest(path)
+        validate_manifest(manifest)
+
+        configured = self.settings.get("batch_configs")
+        values = [item for item in configured if isinstance(item, str)] if isinstance(configured, list) else []
+        known = {str(Path(item).expanduser().resolve(strict=False)) for item in values}
+        if str(path) not in known:
+            values.append(str(path))
+            self._save_preferences({"batch_configs": values})
+        self.discover_manifests()
+        self.load_manifest(path)
+        self.page = "batch"
+        self.render_page()
+        self.notify(f"batch config added: {self.display_manifest_path(path)}")
+
     def action_show_batch(self) -> None:
         if self.selected_manifest is None:
             self.page = "home"
@@ -1217,6 +1312,7 @@ class BatchAgentTui(App[None]):
         if run_id not in self.run_completion_tokens():
             raise RuntimeError(f"run not found for selected batch: {run_id}")
         self.selected_run_id = run_id
+        self.reset_completion()
         self.page = "run"
         self.render_page()
 
@@ -1250,10 +1346,11 @@ class BatchAgentTui(App[None]):
             self.command_show_run(args)
             return
         self.selected_run_id = ""
+        self.reset_completion()
         self.page = "batch"
         self.render_page()
 
-    async def command_run(self, args: list[str]) -> None:
+    async def command_run(self, args: list[str], *, pause_after: int | None = None) -> None:
         if self.run_task and not self.run_task.done():
             raise RuntimeError("A batch is already running in this TUI.")
         token, only, retry_failed, inline_vars, limit, focus, harness, resume_id = self.parse_run_args(args)
@@ -1261,6 +1358,8 @@ class BatchAgentTui(App[None]):
             self.load_manifest_by_token(token)
         manifest = self.require_manifest()
         if resume_id:
+            if pause_after is not None:
+                raise RuntimeError("/try cannot resume an existing Run")
             run_record, frozen_run_tasks = self.persisted_run_snapshot(resume_id)
             if str(run_record["status"]) not in {"paused", "failed", "interrupted"}:
                 raise RuntimeError(f"run is not resumable: {resume_id} (status={run_record['status']})")
@@ -1283,6 +1382,11 @@ class BatchAgentTui(App[None]):
         self.current_work_id = run_id
         self.active_run_id = run_id
         self.selected_run_id = run_id
+        manifest_key = str(manifest.path.resolve())
+        if self._run_completion_cache_key == manifest_key and run_id not in self._run_completion_cache:
+            self._run_completion_cache.insert(0, run_id)
+        self._task_completion_cache_run_id = run_id
+        self._task_completion_cache = [task.id for task in progress_manifest.tasks]
         self.active_manifest_path = manifest.path.resolve()
         self.pause_event = asyncio.Event()
         self.pause_requested = False
@@ -1305,6 +1409,7 @@ class BatchAgentTui(App[None]):
             coroutine = run_manifest(
                 manifest.path,
                 limit=limit,
+                pause_after=pause_after,
                 retry_failed=retry_failed,
                 task_ids=only,
                 run_id=run_id,
@@ -1317,10 +1422,21 @@ class BatchAgentTui(App[None]):
         self.run_task.add_done_callback(self.finish_run)
         self.render_page()
 
-    async def command_resume(self, args: list[str]) -> None:
+    async def command_try(self, args: list[str]) -> None:
         if len(args) != 1:
-            raise RuntimeError("Usage: /resume <run-id>")
-        await self.command_run(["--resume", args[0]])
+            raise RuntimeError("Usage: /try <num>")
+        count = self.parse_limit_arg(args[0])
+        if count == 0:
+            raise RuntimeError("/try requires a positive number")
+        await self.command_run([], pause_after=count)
+
+    async def command_resume(self, args: list[str]) -> None:
+        if len(args) > 1:
+            raise RuntimeError("Usage: /resume [run-id]")
+        run_id = args[0] if args else self.selected_run_id
+        if not run_id:
+            raise RuntimeError("No Run selected. Use /show_run <run-id> or /resume <run-id>.")
+        await self.command_run(["--resume", run_id])
 
     async def action_quit(self) -> None:
         await self.safe_quit()
@@ -1354,7 +1470,7 @@ class BatchAgentTui(App[None]):
             raise RuntimeError("Usage: /retry <task-id>")
         if not self.selected_run_id:
             raise RuntimeError("Select a Run before retrying a Task.")
-        store = self.open_store_if_present()
+        store = self.open_store_if_present(read_only=False)
         if store is None:
             raise RuntimeError("No persisted state database yet.")
         try:
@@ -1570,13 +1686,19 @@ class BatchAgentTui(App[None]):
 
     def handle_progress_event(self, event: dict[str, Any]) -> None:
         if self.progress_state is None:
+            # Keep the persisted fallback refreshable even if an older TUI
+            # session already discarded its live ProgressState.
+            self._run_render_dirty = True
             return
         self.progress_state.handle_event(event)
         run_id = str(event.get("run_id") or event.get("work_id") or "")
         if run_id:
             self.current_work_id = run_id
             self.active_run_id = run_id
-            self.selected_run_id = run_id
+            selected_path = self.selected_manifest_path.resolve() if self.selected_manifest_path else None
+            viewing_active_batch = self.active_manifest_path is None or selected_path == self.active_manifest_path
+            if viewing_active_batch and self.selected_run_id in {"", run_id}:
+                self.selected_run_id = run_id
         task_id = str(event.get("task_id") or "")
         if task_id and not self.focus_task_id:
             self.focus_task_id = task_id
@@ -1587,6 +1709,8 @@ class BatchAgentTui(App[None]):
         if self.page != "run":
             return
         if self.run_task and not self.run_task.done():
+            if not self._run_render_dirty and time.monotonic() - self._last_run_render_at < 1.0:
+                return
             self.render_run()
             self._run_render_dirty = False
             return
@@ -1637,6 +1761,11 @@ class BatchAgentTui(App[None]):
             self.exit()
 
     def refresh_current(self) -> None:
+        self.reset_completion()
+        self._run_completion_cache_key = ""
+        self._run_completion_cache = []
+        self._task_completion_cache_run_id = ""
+        self._task_completion_cache = []
         if self.selected_manifest_path:
             self.load_manifest(self.selected_manifest_path)
         self.discover_manifests()
@@ -1656,11 +1785,18 @@ class BatchAgentTui(App[None]):
         previous_path = self.selected_manifest_path.resolve() if self.selected_manifest_path else None
         manifest = load_manifest(path)
         validate_manifest(manifest)
+        self.reset_completion()
         self.selected_manifest = manifest
         self.selected_manifest_path = manifest.path
         if previous_path is not None and previous_path != manifest.path.resolve():
             self.selected_run_id = ""
-            self.progress_state = None
+            active_run = bool(self.run_task and not self.run_task.done() and self.active_run_id)
+            if not active_run:
+                self.progress_state = None
+            self._run_completion_cache_key = ""
+            self._run_completion_cache = []
+            self._task_completion_cache_run_id = ""
+            self._task_completion_cache = []
         task_ids = {task.id for task in manifest.tasks}
         if manifest.tasks and self.focus_task_id not in task_ids:
             self.focus_task_id = manifest.tasks[0].id
@@ -1745,7 +1881,7 @@ class BatchAgentTui(App[None]):
         db_path = state_db_path(manifest)
         if not db_path.exists():
             return ["persisted output:", "(no state database yet)"]
-        store = SessionStore(db_path)
+        store = SessionStore(db_path, read_only=True)
         try:
             selected_run = run_id
             if not selected_run:

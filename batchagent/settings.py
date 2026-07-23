@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -14,6 +15,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "version": SETTINGS_VERSION,
     "theme": "textual-dark",
     "harness": "native",
+    "batch_configs": [],
 }
 
 
@@ -24,21 +26,21 @@ class SettingsError(ValueError):
 def load_settings(path: Path | None = None) -> dict[str, Any]:
     target = path or settings_path()
     if not target.exists():
-        return dict(DEFAULT_SETTINGS)
+        return copy.deepcopy(DEFAULT_SETTINGS)
     try:
         raw = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise SettingsError(f"cannot read settings from {target}: {exc}") from exc
     if not isinstance(raw, dict):
         raise SettingsError(f"settings must be a JSON object: {target}")
-    settings = dict(DEFAULT_SETTINGS)
+    settings = copy.deepcopy(DEFAULT_SETTINGS)
     settings.update(raw)
     return settings
 
 
 def save_settings(settings: Mapping[str, Any], path: Path | None = None) -> Path:
     target = path or settings_path()
-    values = dict(DEFAULT_SETTINGS)
+    values = copy.deepcopy(DEFAULT_SETTINGS)
     values.update(settings)
     values["version"] = SETTINGS_VERSION
     try:

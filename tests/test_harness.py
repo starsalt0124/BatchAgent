@@ -181,6 +181,17 @@ class HarnessTests(unittest.TestCase):
             self.assertTrue(probe.available)
             self.assertEqual(probe.version, "fake-harness 1.2.3")
 
+    def test_external_prompt_can_omit_bagent_protocol(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = _write_fake(root / "fake.py")
+            request = self.make_request(root, script)
+            request.config.inject_batchagent_protocol = False
+
+            invocation = asyncio.run(OpenCodeHarness().build_invocation(request))
+            self.assertEqual(invocation.prompt, "secret prompt text\n")
+            self.assertNotIn("Bagent external harness protocol", invocation.prompt)
+
     def test_codex_builds_sandboxed_json_invocation_with_scoped_mcp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

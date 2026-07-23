@@ -24,8 +24,19 @@ class SessionStore:
     and ``work_id`` meant the containing batch run.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only: bool = False):
         self.path = path.expanduser()
+        self.read_only = read_only
+        if read_only:
+            # TUI reads are latency-sensitive and the database is already
+            # initialized by the scheduler. Avoid schema DDL and its commit.
+            uri = self.path.resolve(strict=False).as_uri() + "?mode=ro"
+            self.conn = sqlite3.connect(uri, uri=True, timeout=30)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA query_only=ON")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.conn.execute("PRAGMA busy_timeout=30000")
+            return
         ensure_private_dir(self.path.parent)
         self.conn = sqlite3.connect(str(self.path), timeout=30)
         self.conn.row_factory = sqlite3.Row

@@ -16,6 +16,7 @@ class SettingsTests(unittest.TestCase):
             path = Path(tmp) / "missing.json"
             first = load_settings(path)
             first["theme"] = "changed"
+            first["batch_configs"].append("/tmp/demo.md")
             self.assertEqual(load_settings(path), DEFAULT_SETTINGS)
             self.assertFalse(path.exists())
 

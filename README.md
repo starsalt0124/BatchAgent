@@ -1,6 +1,6 @@
 # BatchAgent
 
-BatchAgent is a Markdown-driven harness for running repeated agent tasks from a parseable task list. It is intended for workloads like patch analysis, dataset item review, issue triage, and other batch jobs where each item has the same structure and the harness must keep reliable progress.
+BatchAgent is a harness of harness for running repeated agent tasks from a parseable task list. It is intended for workloads like data analysis, dataset item review, issue triage, and other batch jobs where each item has the same structure and the harness must keep reliable progress.
 
 ## Why not only use an agent framework?
 
@@ -43,7 +43,7 @@ On Linux/macOS:
 bagent --help
 ```
 
-## DeepSeek Provider
+## DeepSeek Provider (built-in harness)
 
 The default provider is DeepSeek's OpenAI-compatible Chat Completions API:
 
@@ -112,6 +112,10 @@ blocked_path_patterns = [
 system_prompt = """
 You are a patch compatibility analysis agent.
 """
+
+# Set false when an external harness already supplies its own tool guidance.
+# This omits the generated "BatchAgent harness protocol" block.
+inject_batchagent_protocol = true
 
 user_prompt_template = """
 Analyze one patch.
@@ -188,10 +192,12 @@ TUI layout:
 Core TUI commands:
 
 ```text
+/add <path-to-batch-config>
 /show_batch <manifest-path>
 /show_run <run-id>
 /run [manifest-path] [--only task-id] [--harness name]
-/resume <run-id>
+/try <num>
+/resume [run-id]
 /show_task <task-id>
 /history [run-id]
 /retry <task-id>
@@ -201,6 +207,18 @@ Core TUI commands:
 /refresh
 /quit
 ```
+
+Automatic discovery looks for files named exactly `BATCHAGENT.md` below the
+current directory. `/show_batch <path>` and `/run <path>` can open any valid
+manifest for the current session. `/add <path>` additionally saves its absolute
+path in `~/.bagent/settings.json`, so custom names and manifests outside the
+current directory remain in the Batch list after restarting the TUI.
+
+`/try <num>` creates a Run containing all eligible Tasks, executes only the
+first `num`, and leaves the remainder queued with the Run in `paused` state.
+Use `/resume` for the currently selected Run or `/resume <run-id>` to finish it.
+This differs from `/run --limit <num>`, which creates a Run containing only the
+limited selection and therefore has no remaining Tasks to resume.
 
 Type `/` in the TUI command input to show commands with usage examples and descriptions. Use `Up` / `Down` to select a candidate and `Tab` to accept it. Selecting a Batch Config first shows its Run list. Selecting a Run then shows its Tasks. Opening a Task shows every Attempt and the selected Attempt's messages, tools, usage, result, and artifacts.
 
@@ -230,7 +248,7 @@ Create a Run:
 bagent run BATCHAGENT.md --limit 2
 ```
 
-Every `/run` creates a new `run_id`. Every Task execution gets a unique `attempt_id` and a directory under `~/.bagent/runs/<run-id>/<task-id>/<attempt-id>/` by default. `/resume` keeps the existing `run_id`; `/retry` adds an Attempt to the selected Task; `/rerun` creates a new Run. Earlier directories, artifacts, and SQLite records are never overwritten.
+Every `/run` or `/try` creates a new `run_id`. Every Task execution gets a unique `attempt_id` and a directory under `~/.bagent/runs/<run-id>/<task-id>/<attempt-id>/` by default. `/resume` keeps the existing `run_id`; `/retry` adds an Attempt to the selected Task; `/rerun` creates a new Run. Earlier directories, artifacts, and SQLite records are never overwritten.
 
 `run` opens the same Textual TUI as `bagent tui` and starts the Run automatically. The live page shows the Run id, Task status, current Attempt id, elapsed time, ETA, model/tool output, and artifact submission.
 

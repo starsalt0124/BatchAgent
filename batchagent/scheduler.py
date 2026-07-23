@@ -37,6 +37,7 @@ async def run_manifest(
     manifest_path: str | Path,
     *,
     limit: int | None = None,
+    pause_after: int | None = None,
     retry_failed: bool = False,
     task_ids: set[str] | None = None,
     run_id: str | None = None,
@@ -47,6 +48,10 @@ async def run_manifest(
     progress_callback: ProgressCallback | None = None,
     pause_event: asyncio.Event | None = None,
 ) -> list[AgentRunResult]:
+    if pause_after is not None and pause_after < 0:
+        raise SchedulerError("pause_after must be non-negative")
+    if resume and pause_after is not None:
+        raise SchedulerError("pause_after is only valid when creating a new Run")
     manifest = load_manifest(manifest_path)
     run_id = run_id or work_id or new_run_id()
     store = SessionStore(_state_db_path(manifest))
@@ -137,6 +142,7 @@ async def run_manifest(
                 config_hash=hashlib.sha256(manifest.text.encode("utf-8")).hexdigest(),
             )
             run_claimed = True
+        scheduled = eligible if pause_after is None else eligible[:pause_after]
         _clear_pause_request(run_id)
         _emit(
             progress_callback,
@@ -149,6 +155,8 @@ async def run_manifest(
                 "resumed": resume,
                 "total_tasks": len(store.run_tasks(run_id)),
                 "eligible_tasks": len(eligible),
+                "scheduled_tasks": len(scheduled),
+                "pause_after": pause_after,
                 "concurrency": manifest.config.effective_concurrency,
                 "started_at": utc_now(),
             },
@@ -168,7 +176,7 @@ async def run_manifest(
         if manifest.config.task_selector_script or manifest.config.task_selector_command:
             results = await _run_manifest_with_task_selector(
                 manifest,
-                eligible,
+                scheduled,
                 store,
                 write_lock,
                 run_id,
@@ -183,7 +191,7 @@ async def run_manifest(
         else:
             results = await _run_manifest_default(
                 manifest,
-                eligible,
+                scheduled,
                 store,
                 write_lock,
                 run_id,
@@ -569,7 +577,7 @@ def status(manifest_path: str | Path) -> dict[str, int]:
     manifest = load_manifest(manifest_path)
     db_path = _state_db_path(manifest)
     if db_path.exists():
-        store = SessionStore(db_path)
+        store = SessionStore(db_path, read_only=True)
         try:
             runs = store.batch_runs(manifest.path, limit=1)
             if runs:

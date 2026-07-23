@@ -878,6 +878,8 @@ async def _emit_new_progress_events(request: HarnessRequest, seen: set[str]) -> 
 
 
 def _external_prompt(request: HarnessRequest) -> str:
+    if not request.config.inject_batchagent_protocol:
+        return request.prompt.strip() + "\n"
     if request.runtime_config.inject_tools:
         submit = (
             "Before finishing, call the bagent MCP submit_artifact tool exactly once; final text alone does not complete the attempt."
